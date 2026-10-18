@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <fstream>
 #include <cstdio>
+#include <functional>
 
 namespace ctseg {
 
@@ -38,11 +39,20 @@ public:
 
     // Lists all slice files in a directory matching an extension,
     // sorted in natural order — needed for building a 3D volume.
+    //
+    // Defensively skips any "*.cleaned.tif" file even though sanitized
+    // copies are no longer written into the slice directory at all (see
+    // sanitizeResolutionTags) - this guards against stray .cleaned.tif
+    // files left behind by an earlier version of this code, which really
+    // did write them here and would otherwise get double-counted as
+    // extra slices if this directory is reused.
     static std::vector<std::string> listSlices(const std::string& dir,
                                                 const std::string& extension = ".tif") {
         std::vector<std::string> files;
         for (const auto& entry : std::filesystem::directory_iterator(dir)) {
-            if (entry.path().extension() == extension) {
+            const std::string name = entry.path().filename().string();
+            if (entry.path().extension() == extension &&
+                name.find(".cleaned.tif") == std::string::npos) {
                 files.push_back(entry.path().string());
             }
         }
@@ -81,12 +91,29 @@ public:
         return reader->GetOutput();
     }
 
-private:
     // Strips XResolution/YResolution/ResolutionUnit tags by invoking a
-    // small Python helper (tifffile is already used elsewhere in this
-    // project's workflow) and writes a cleaned copy alongside the original.
+    // small Python helper and writes a cleaned copy to the SYSTEM TEMP
+    // DIRECTORY, keyed by a hash of the original path so repeated calls
+    // for the same file reuse the cached copy instead of re-cleaning it.
+    //
+    // IMPORTANT: this deliberately does NOT write next to the original
+    // file anymore. An earlier version wrote "<path>.cleaned.tif" right
+    // next to the source slice - since that filename still ends in
+    // ".tif", listSlices() (and VolumeIO's directory stacking, which
+    // calls this same sanitize path) picked the cleaned copies up as
+    // EXTRA slices, interleaving them with the originals in sorted order
+    // and corrupting the volume's slice order and count. Writing to a
+    // separate temp directory makes that bug structurally impossible,
+    // rather than relying on every caller to filter ".cleaned." names.
     static std::string sanitizeResolutionTags(const std::string& path) {
-        std::string cleaned = path + ".cleaned.tif";
+        auto tempDir = std::filesystem::temp_directory_path() / "ctseg_cleaned_tiffs";
+        std::filesystem::create_directories(tempDir);
+
+        size_t h = std::hash<std::string>{}(std::filesystem::absolute(path).string());
+        std::string cleaned = (tempDir / (std::to_string(h) + ".tif")).string();
+
+        if (std::filesystem::exists(cleaned)) return cleaned; // already cleaned, reuse it
+
         std::string cmd = "python3 -c \"import tifffile; a = tifffile.imread('" + path +
                            "'); tifffile.imwrite('" + cleaned + "', a)\"";
         int rc = std::system(cmd.c_str());
@@ -95,6 +122,7 @@ private:
         }
         return cleaned;
     }
+
 };
 
-} 
+} // namespace ctseg

@@ -7,6 +7,7 @@ namespace ctseg {
 
 // Global (binary) Otsu thresholding: single threshold separating
 // foreground from background by maximizing between-class variance.
+// Simplest baseline method in the Plan of Action's method list.
 class GlobalOtsuSegmenter : public ISegmenter {
 public:
     std::string name() const override { return "GlobalOtsu"; }
@@ -35,4 +36,4 @@ public:
     double lastThreshold = 0.0;
 };
 
-} 
+} // namespace ctseg

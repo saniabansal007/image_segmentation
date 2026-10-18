@@ -11,7 +11,8 @@ namespace ctseg {
 
 class Preprocessing {
 public:
-    // Median filter denoising: replaces a pixel value with median of pixels within radius r.
+    // Median filter denoising — cheap, edge-preserving enough for a first
+    // pass; operates directly on the native 16-bit pixel type.
     static ImageType::Pointer denoiseMedian(ImageType::Pointer input, unsigned int radius = 2) {
         using FilterType = itk::MedianImageFilter<ImageType, ImageType>;
         auto filter = FilterType::New();
@@ -25,7 +26,7 @@ public:
 
     // Discrete Gaussian denoising — smoother than median, better for
     // preserving gradual intensity transitions; useful as an alternative
-    // to compare against median filtering.
+    // to compare against median filtering (Plan of Action point 7).
     static ImageType::Pointer denoiseGaussian(ImageType::Pointer input, double variance = 1.0) {
         using FilterType = itk::DiscreteGaussianImageFilter<ImageType, ImageType>;
         auto filter = FilterType::New();
@@ -122,4 +123,4 @@ public:
     }
 };
 
-} 
+} // namespace ctseg

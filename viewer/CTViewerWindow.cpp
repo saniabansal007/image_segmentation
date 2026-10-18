@@ -1,0 +1,1691 @@
+#include "CTViewerWindow.hpp"
+#include "../volume/VolumeIO.hpp"
+#include "../io/SliceIO.hpp"
+#include "../preprocessing/Preprocessing.hpp"
+
+#include <QApplication>
+#include <QMenuBar>
+#include <QMenu>
+#include <QAction>
+#include <QFileDialog>
+#include <QMessageBox>
+#include <QScrollArea>
+#include <QFormLayout>
+#include <QGridLayout>
+#include <QHBoxLayout>
+#include <QVBoxLayout>
+#include <QWindow>
+#include <QScreen>
+#include <QPixmap>
+#include <QElapsedTimer>
+#include <QDir>
+
+// ITK Filters
+#include <itkMinimumMaximumImageCalculator.h>
+#include <itkImageRegionConstIterator.h>
+#include <itkDiscreteGaussianImageFilter.h>
+#include <itkMedianImageFilter.h>
+#include <itkGradientAnisotropicDiffusionImageFilter.h>
+#include <itkBinaryThresholdImageFilter.h>
+#include <itkOtsuThresholdImageFilter.h>
+#include <itkOtsuMultipleThresholdsImageFilter.h>
+#include <itkConfidenceConnectedImageFilter.h>
+#include <itkConnectedThresholdImageFilter.h>
+#include <itkScalarImageKmeansImageFilter.h>
+#include <itkCastImageFilter.h>
+#include <itkExtractImageFilter.h>
+#include <itkTileImageFilter.h>
+#include <itkOutputWindow.h>
+
+#include <chrono>
+#include <vector>
+#include <algorithm>
+#include <cmath>
+#include <iostream>
+
+namespace ctseg {
+
+CTViewerWindow::CTViewerWindow(QWidget* parent) : QMainWindow(parent) {
+    // Suppress redundant ITK warning popups
+    itk::OutputWindow::SetGlobalWarningDisplay(false);
+
+    setWindowTitle("CT Medical Image Segmentation & Multi-Plane Viewer [ITK / VTK / Qt]");
+    resize(1600, 950);
+
+    applyDarkTheme();
+    setupUI();
+    setupMenuBar();
+    setupStatusBar();
+}
+
+void CTViewerWindow::applyDarkTheme() {
+    setStyleSheet(
+        "QMainWindow { background-color: #0F172A; }"
+        "QWidget { color: #E2E8F0; font-family: 'Segoe UI', Arial, sans-serif; font-size: 12px; }"
+        "QGroupBox { font-weight: bold; font-size: 12px; border: 1px solid #334155; border-radius: 6px; margin-top: 10px; padding-top: 12px; background-color: #1E293B; }"
+        "QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; left: 10px; padding: 0 4px; color: #38BDF8; }"
+        "QPushButton { background-color: #2563EB; color: #FFFFFF; font-weight: bold; border-radius: 4px; padding: 6px 12px; border: none; }"
+        "QPushButton:hover { background-color: #1D4ED8; }"
+        "QPushButton:pressed { background-color: #1E40AF; }"
+        "QPushButton:disabled { background-color: #334155; color: #64748B; }"
+        "QComboBox, QSpinBox, QDoubleSpinBox { background-color: #0F172A; border: 1px solid #475569; border-radius: 4px; padding: 4px 6px; color: #F8FAFC; selection-background-color: #2563EB; }"
+        "QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus { border: 1px solid #38BDF8; }"
+        "QComboBox QAbstractItemView { background-color: #1E293B; color: #F8FAFC; selection-background-color: #2563EB; border: 1px solid #475569; }"
+        "QSlider::groove:horizontal { height: 5px; background: #334155; border-radius: 2px; }"
+        "QSlider::sub-page:horizontal { background: #38BDF8; border-radius: 2px; }"
+        "QSlider::handle:horizontal { background: #F8FAFC; width: 14px; margin-top: -5px; margin-bottom: -5px; border-radius: 7px; }"
+        "QCheckBox, QRadioButton { spacing: 6px; }"
+        "QCheckBox::indicator, QRadioButton::indicator { width: 15px; height: 15px; }"
+        "QStatusBar { background-color: #0B1120; border-top: 1px solid #1E293B; color: #94A3B8; font-size: 11px; }"
+        "QMenuBar { background-color: #0F172A; border-bottom: 1px solid #1E293B; color: #E2E8F0; }"
+        "QMenuBar::item:selected { background-color: #1E293B; }"
+        "QMenu { background-color: #1E293B; border: 1px solid #334155; color: #E2E8F0; }"
+        "QMenu::item:selected { background-color: #2563EB; color: #FFFFFF; }"
+        "QScrollArea { border: none; background-color: transparent; }"
+        "QSplitter::handle { background-color: #1E293B; }"
+    );
+}
+
+void CTViewerWindow::setupMenuBar() {
+    auto* fileMenu = menuBar()->addMenu("&File");
+    auto* openDirAct = fileMenu->addAction("Open Slice &Directory (3D Volume)...");
+    connect(openDirAct, &QAction::triggered, this, &CTViewerWindow::onOpenDirectoryTriggered);
+
+    auto* openSliceAct = fileMenu->addAction("Open Single &2D Slice...");
+    connect(openSliceAct, &QAction::triggered, this, &CTViewerWindow::onOpenSingleSliceTriggered);
+
+    fileMenu->addSeparator();
+    auto* exportFilteredAct = fileMenu->addAction("Export Filtered Image as TIFF...");
+    connect(exportFilteredAct, &QAction::triggered, this, &CTViewerWindow::onExportFilteredClicked);
+
+    auto* exportMaskAct = fileMenu->addAction("Export Segmentation Mask as TIFF...");
+    connect(exportMaskAct, &QAction::triggered, this, &CTViewerWindow::onExportMaskClicked);
+
+    auto* exportMaskedAct = fileMenu->addAction("Export Segmented CT (Masked ROI) as TIFF...");
+    connect(exportMaskedAct, &QAction::triggered, this, &CTViewerWindow::onExportMaskedCTClicked);
+
+    fileMenu->addSeparator();
+    auto* exitAct = fileMenu->addAction("E&xit");
+    connect(exitAct, &QAction::triggered, this, &QWidget::close);
+
+    auto* viewMenu = menuBar()->addMenu("&View");
+    auto* layout3Act = viewMenu->addAction("3-View Orthogonal (Axial | Coronal | Sagittal)");
+    connect(layout3Act, &QAction::triggered, [this]() { onViewLayoutChanged(0); });
+    auto* layoutAxialAct = viewMenu->addAction("Axial View Only");
+    connect(layoutAxialAct, &QAction::triggered, [this]() { onViewLayoutChanged(1); });
+    auto* layoutCoronalAct = viewMenu->addAction("Coronal View Only");
+    connect(layoutCoronalAct, &QAction::triggered, [this]() { onViewLayoutChanged(2); });
+    auto* layoutSagittalAct = viewMenu->addAction("Sagittal View Only");
+    connect(layoutSagittalAct, &QAction::triggered, [this]() { onViewLayoutChanged(3); });
+
+    viewMenu->addSeparator();
+    auto* resetCamAct = viewMenu->addAction("Reset Cameras / Fit to Window");
+    connect(resetCamAct, &QAction::triggered, this, &CTViewerWindow::onResetCamerasClicked);
+
+    auto* helpMenu = menuBar()->addMenu("&Help");
+    auto* aboutAct = helpMenu->addAction("&About CT Segmentation Viewer");
+    connect(aboutAct, &QAction::triggered, this, &CTViewerWindow::onAboutTriggered);
+}
+
+void CTViewerWindow::setupUI() {
+    mainSplitter_ = new QSplitter(Qt::Horizontal, this);
+    setCentralWidget(mainSplitter_);
+
+    // Left Control Panel with scroll area
+    auto* scrollArea = new QScrollArea(this);
+    scrollArea->setWidgetResizable(true);
+    scrollArea->setMinimumWidth(380);
+    scrollArea->setMaximumWidth(460);
+
+    auto* panelContent = new QWidget(scrollArea);
+    setupControlPanel(panelContent);
+    scrollArea->setWidget(panelContent);
+    mainSplitter_->addWidget(scrollArea);
+
+    // Right View Area
+    auto* viewContainer = new QWidget(this);
+    setupViewArea(viewContainer);
+    mainSplitter_->addWidget(viewContainer);
+
+    mainSplitter_->setStretchFactor(0, 0);
+    mainSplitter_->setStretchFactor(1, 1);
+}
+
+void CTViewerWindow::setupControlPanel(QWidget* panel) {
+    auto* layout = new QVBoxLayout(panel);
+    layout->setContentsMargins(8, 8, 8, 8);
+    layout->setSpacing(10);
+
+    // 1. DATASET INFO & CONTRAST (WINDOW / LEVEL)
+    auto* infoGroup = new QGroupBox("Dataset & Contrast (Window / Level)", panel);
+    auto* infoLayout = new QVBoxLayout(infoGroup);
+    infoLayout->setSpacing(6);
+
+    datasetInfoLabel_ = new QLabel("No dataset loaded.\nUse File -> Open to load slices.", infoGroup);
+    datasetInfoLabel_->setStyleSheet("color: #94A3B8; font-size: 11px;");
+    infoLayout->addWidget(datasetInfoLabel_);
+
+    auto* presetLayout = new QHBoxLayout();
+    presetLayout->addWidget(new QLabel("Preset:", infoGroup));
+    presetComboBox_ = new QComboBox(infoGroup);
+    presetComboBox_->addItems({"Auto (1%-99% Percentile)", "Full Range", "Bone (W:1500, L:400)", "Soft Tissue (W:350, L:40)", "Lung (W:1500, L:-500)"});
+    connect(presetComboBox_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &CTViewerWindow::onPresetChanged);
+    presetLayout->addWidget(presetComboBox_, 1);
+    infoLayout->addLayout(presetLayout);
+
+    // Window Slider & SpinBox
+    auto* winLayout = new QHBoxLayout();
+    winLayout->addWidget(new QLabel("Window:", infoGroup));
+    windowSlider_ = new QSlider(Qt::Horizontal, infoGroup);
+    windowSlider_->setRange(1, 65535);
+    windowSlider_->setValue(1000);
+    connect(windowSlider_, &QSlider::valueChanged, this, &CTViewerWindow::onWindowSliderChanged);
+    winLayout->addWidget(windowSlider_, 1);
+    windowSpinBox_ = new QSpinBox(infoGroup);
+    windowSpinBox_->setRange(1, 65535);
+    windowSpinBox_->setValue(1000);
+    connect(windowSpinBox_, QOverload<int>::of(&QSpinBox::valueChanged), this, &CTViewerWindow::onWindowSliderChanged);
+    winLayout->addWidget(windowSpinBox_);
+    infoLayout->addLayout(winLayout);
+
+    // Level Slider & SpinBox
+    auto* lvlLayout = new QHBoxLayout();
+    lvlLayout->addWidget(new QLabel("Level:   ", infoGroup));
+    levelSlider_ = new QSlider(Qt::Horizontal, infoGroup);
+    levelSlider_->setRange(0, 65535);
+    levelSlider_->setValue(500);
+    connect(levelSlider_, &QSlider::valueChanged, this, &CTViewerWindow::onLevelSliderChanged);
+    lvlLayout->addWidget(levelSlider_, 1);
+    levelSpinBox_ = new QSpinBox(infoGroup);
+    levelSpinBox_->setRange(-10000, 65535);
+    levelSpinBox_->setValue(500);
+    connect(levelSpinBox_, QOverload<int>::of(&QSpinBox::valueChanged), this, &CTViewerWindow::onLevelSliderChanged);
+    lvlLayout->addWidget(levelSpinBox_);
+    infoLayout->addLayout(lvlLayout);
+
+    auto* camBtnLayout = new QHBoxLayout();
+    auto* autoWlBtn = new QPushButton("Auto W/L", infoGroup);
+    autoWlBtn->setStyleSheet("background-color: #334155; padding: 4px 8px; font-size: 11px;");
+    connect(autoWlBtn, &QPushButton::clicked, this, &CTViewerWindow::onAutoWindowLevelClicked);
+    camBtnLayout->addWidget(autoWlBtn);
+
+    auto* resetCamBtn = new QPushButton("Reset Cameras", infoGroup);
+    resetCamBtn->setStyleSheet("background-color: #334155; padding: 4px 8px; font-size: 11px;");
+    connect(resetCamBtn, &QPushButton::clicked, this, &CTViewerWindow::onResetCamerasClicked);
+    camBtnLayout->addWidget(resetCamBtn);
+
+    crosshairsCheckBox_ = new QCheckBox("Show Crosshairs", infoGroup);
+    crosshairsCheckBox_->setChecked(true);
+    connect(crosshairsCheckBox_, &QCheckBox::toggled, this, &CTViewerWindow::onCrosshairToggled);
+    camBtnLayout->addWidget(crosshairsCheckBox_);
+
+    infoLayout->addLayout(camBtnLayout);
+    layout->addWidget(infoGroup);
+
+    // 2. PREPROCESSING FILTER PANEL
+    auto* filterGroup = new QGroupBox("Preprocessing Filter", panel);
+    auto* filterLayout = new QVBoxLayout(filterGroup);
+    filterLayout->setSpacing(6);
+
+    auto* filterSelectLayout = new QHBoxLayout();
+    filterSelectLayout->addWidget(new QLabel("Filter:", filterGroup));
+    filterComboBox_ = new QComboBox(filterGroup);
+    filterComboBox_->addItems({"1. None / Original", "2. Gaussian Smoothing", "3. Median Filter", "4. Anisotropic Diffusion", "5. Ring Artifact Correction"});
+    connect(filterComboBox_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &CTViewerWindow::onFilterSelectionChanged);
+    filterSelectLayout->addWidget(filterComboBox_, 1);
+    filterLayout->addLayout(filterSelectLayout);
+
+    // Filter Parameter Stack
+    filterParamsStack_ = new QStackedWidget(filterGroup);
+
+    // Stack 0: None
+    auto* noneWidget = new QLabel("Original unfiltered CT volume.", filterGroup);
+    noneWidget->setStyleSheet("color: #94A3B8; font-style: italic;");
+    filterParamsStack_->addWidget(noneWidget);
+
+    // Stack 1: Gaussian
+    auto* gaussWidget = new QWidget(filterGroup);
+    auto* gaussLayout = new QFormLayout(gaussWidget);
+    gaussLayout->setContentsMargins(0, 0, 0, 0);
+    gaussianSigmaSpin_ = new QDoubleSpinBox(gaussWidget);
+    gaussianSigmaSpin_->setRange(0.1, 8.0);
+    gaussianSigmaSpin_->setValue(1.5);
+    gaussianSigmaSpin_->setSingleStep(0.2);
+    gaussLayout->addRow("Sigma (voxels):", gaussianSigmaSpin_);
+    filterParamsStack_->addWidget(gaussWidget);
+
+    // Stack 2: Median
+    auto* medianWidget = new QWidget(filterGroup);
+    auto* medianLayout = new QFormLayout(medianWidget);
+    medianLayout->setContentsMargins(0, 0, 0, 0);
+    medianRadiusSpin_ = new QSpinBox(medianWidget);
+    medianRadiusSpin_->setRange(1, 4);
+    medianRadiusSpin_->setValue(1);
+    medianLayout->addRow("Neighborhood Radius:", medianRadiusSpin_);
+    filterParamsStack_->addWidget(medianWidget);
+
+    // Stack 3: Anisotropic Diffusion
+    auto* anisoWidget = new QWidget(filterGroup);
+    auto* anisoLayout = new QFormLayout(anisoWidget);
+    anisoLayout->setContentsMargins(0, 0, 0, 0);
+    anisoIterSpin_ = new QSpinBox(anisoWidget);
+    anisoIterSpin_->setRange(1, 20);
+    anisoIterSpin_->setValue(5);
+    anisoLayout->addRow("Iterations:", anisoIterSpin_);
+
+    anisoConductanceSpin_ = new QDoubleSpinBox(anisoWidget);
+    anisoConductanceSpin_->setRange(0.5, 15.0);
+    anisoConductanceSpin_->setValue(3.0);
+    anisoConductanceSpin_->setSingleStep(0.5);
+    anisoLayout->addRow("Conductance:", anisoConductanceSpin_);
+
+    anisoTimeStepSpin_ = new QDoubleSpinBox(anisoWidget);
+    anisoTimeStepSpin_->setRange(0.01, 0.125);
+    anisoTimeStepSpin_->setValue(0.0625);
+    anisoTimeStepSpin_->setDecimals(4);
+    anisoLayout->addRow("Time Step:", anisoTimeStepSpin_);
+    filterParamsStack_->addWidget(anisoWidget);
+
+    // Stack 4: Ring Artifacts
+    auto* ringWidget = new QWidget(filterGroup);
+    auto* ringLayout = new QFormLayout(ringWidget);
+    ringLayout->setContentsMargins(0, 0, 0, 0);
+    ringRadiusSpin_ = new QSpinBox(ringWidget);
+    ringRadiusSpin_->setRange(5, 50);
+    ringRadiusSpin_->setValue(15);
+    ringLayout->addRow("Smoothing Window:", ringRadiusSpin_);
+    filterParamsStack_->addWidget(ringWidget);
+
+    filterLayout->addWidget(filterParamsStack_);
+
+    auto* filterBtnLayout = new QHBoxLayout();
+    applyFilterBtn_ = new QPushButton("Apply Filter", filterGroup);
+    applyFilterBtn_->setStyleSheet("background-color: #059669; font-weight: bold;");
+    connect(applyFilterBtn_, &QPushButton::clicked, this, &CTViewerWindow::onApplyFilterClicked);
+    filterBtnLayout->addWidget(applyFilterBtn_);
+
+    resetFilterBtn_ = new QPushButton("Reset Filter", filterGroup);
+    resetFilterBtn_->setStyleSheet("background-color: #475569;");
+    connect(resetFilterBtn_, &QPushButton::clicked, this, &CTViewerWindow::onResetFilterClicked);
+    filterBtnLayout->addWidget(resetFilterBtn_);
+    filterLayout->addLayout(filterBtnLayout);
+
+    compareFilterCheck_ = new QCheckBox("Compare: Show Original CT", filterGroup);
+    connect(compareFilterCheck_, &QCheckBox::toggled, this, &CTViewerWindow::onCompareFilterToggled);
+    filterLayout->addWidget(compareFilterCheck_);
+
+    layout->addWidget(filterGroup);
+
+    // 3. SEGMENTATION ALGORITHM PANEL
+    auto* segGroup = new QGroupBox("Segmentation Algorithm", panel);
+    auto* segLayout = new QVBoxLayout(segGroup);
+    segLayout->setSpacing(6);
+
+    auto* segSelectLayout = new QHBoxLayout();
+    segSelectLayout->addWidget(new QLabel("Method:", segGroup));
+    algorithmComboBox_ = new QComboBox(segGroup);
+    algorithmComboBox_->addItems({
+        "1. Threshold Range",
+        "2. Global Otsu",
+        "3. Multi-Otsu Thresholding",
+        "4. Region Growing (Confidence)",
+        "5. Connected Threshold",
+        "6. K-Means Clustering",
+        "7. Canny Edge Morphology",
+        "8. Watershed Segmentation"
+    });
+    connect(algorithmComboBox_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &CTViewerWindow::onAlgorithmSelectionChanged);
+    segSelectLayout->addWidget(algorithmComboBox_, 1);
+    segLayout->addLayout(segSelectLayout);
+
+    // Source selection
+    auto* srcLayout = new QHBoxLayout();
+    srcLayout->addWidget(new QLabel("Operate on:", segGroup));
+    segSourceFilteredRadio_ = new QRadioButton("Filtered Image", segGroup);
+    segSourceFilteredRadio_->setChecked(true);
+    segSourceOriginalRadio_ = new QRadioButton("Original Image", segGroup);
+    auto* srcGroup = new QButtonGroup(segGroup);
+    srcGroup->addButton(segSourceFilteredRadio_);
+    srcGroup->addButton(segSourceOriginalRadio_);
+    srcLayout->addWidget(segSourceFilteredRadio_);
+    srcLayout->addWidget(segSourceOriginalRadio_);
+    segLayout->addLayout(srcLayout);
+
+    // Algorithm Parameters Stack
+    algorithmParamsStack_ = new QStackedWidget(segGroup);
+
+    // Method 0: Threshold Range
+    auto* threshWidget = new QWidget(segGroup);
+    auto* threshLayout = new QFormLayout(threshWidget);
+    threshLayout->setContentsMargins(0, 0, 0, 0);
+    threshLowerSpin_ = new QSpinBox(threshWidget);
+    threshLowerSpin_->setRange(0, 65535);
+    threshLowerSpin_->setValue(2000);
+    threshLayout->addRow("Lower Intensity:", threshLowerSpin_);
+    threshUpperSpin_ = new QSpinBox(threshWidget);
+    threshUpperSpin_->setRange(0, 65535);
+    threshUpperSpin_->setValue(65535);
+    threshLayout->addRow("Upper Intensity:", threshUpperSpin_);
+    algorithmParamsStack_->addWidget(threshWidget);
+
+    // Method 1: Global Otsu
+    auto* otsuWidget = new QLabel("Automatic optimal binary Otsu thresholding.", segGroup);
+    otsuWidget->setStyleSheet("color: #94A3B8; font-style: italic;");
+    algorithmParamsStack_->addWidget(otsuWidget);
+
+    // Method 2: Multi-Otsu
+    auto* multiOtsuWidget = new QWidget(segGroup);
+    auto* multiOtsuLayout = new QFormLayout(multiOtsuWidget);
+    multiOtsuLayout->setContentsMargins(0, 0, 0, 0);
+    multiOtsuClassesSpin_ = new QSpinBox(multiOtsuWidget);
+    multiOtsuClassesSpin_->setRange(2, 5);
+    multiOtsuClassesSpin_->setValue(3);
+    multiOtsuLayout->addRow("Number of Classes:", multiOtsuClassesSpin_);
+    multiOtsuTargetClassSpin_ = new QSpinBox(multiOtsuWidget);
+    multiOtsuTargetClassSpin_->setRange(1, 4);
+    multiOtsuTargetClassSpin_->setValue(2);
+    multiOtsuLayout->addRow("Target Foreground Class:", multiOtsuTargetClassSpin_);
+    algorithmParamsStack_->addWidget(multiOtsuWidget);
+
+    // Method 3: Region Growing (Confidence)
+    auto* rgWidget = new QWidget(segGroup);
+    auto* rgLayout = new QFormLayout(rgWidget);
+    rgLayout->setContentsMargins(0, 0, 0, 0);
+    auto* seedRow = new QHBoxLayout();
+    seedXSpin_ = new QSpinBox(rgWidget); seedXSpin_->setRange(0, 2000);
+    seedYSpin_ = new QSpinBox(rgWidget); seedYSpin_->setRange(0, 2000);
+    seedZSpin_ = new QSpinBox(rgWidget); seedZSpin_->setRange(0, 2000);
+    seedRow->addWidget(new QLabel("X:")); seedRow->addWidget(seedXSpin_);
+    seedRow->addWidget(new QLabel("Y:")); seedRow->addWidget(seedYSpin_);
+    seedRow->addWidget(new QLabel("Z:")); seedRow->addWidget(seedZSpin_);
+    rgLayout->addRow("Seed (Click view):", seedRow);
+
+    regionGrowMultSpin_ = new QDoubleSpinBox(rgWidget);
+    regionGrowMultSpin_->setRange(0.5, 6.0);
+    regionGrowMultSpin_->setValue(2.5);
+    regionGrowMultSpin_->setSingleStep(0.2);
+    rgLayout->addRow("StdDev Multiplier:", regionGrowMultSpin_);
+
+    regionGrowIterSpin_ = new QSpinBox(rgWidget);
+    regionGrowIterSpin_->setRange(1, 10);
+    regionGrowIterSpin_->setValue(5);
+    rgLayout->addRow("Iterations:", regionGrowIterSpin_);
+
+    regionGrowRadiusSpin_ = new QSpinBox(rgWidget);
+    regionGrowRadiusSpin_->setRange(1, 5);
+    regionGrowRadiusSpin_->setValue(2);
+    rgLayout->addRow("Init Radius:", regionGrowRadiusSpin_);
+    algorithmParamsStack_->addWidget(rgWidget);
+
+    // Method 4: Connected Threshold
+    auto* connWidget = new QWidget(segGroup);
+    auto* connLayout = new QFormLayout(connWidget);
+    connLayout->setContentsMargins(0, 0, 0, 0);
+    connThreshLowerSpin_ = new QSpinBox(connWidget);
+    connThreshLowerSpin_->setRange(0, 65535);
+    connThreshLowerSpin_->setValue(1500);
+    connLayout->addRow("Lower Bound:", connThreshLowerSpin_);
+    connThreshUpperSpin_ = new QSpinBox(connWidget);
+    connThreshUpperSpin_->setRange(0, 65535);
+    connThreshUpperSpin_->setValue(4000);
+    connLayout->addRow("Upper Bound:", connThreshUpperSpin_);
+    algorithmParamsStack_->addWidget(connWidget);
+
+    // Method 5: K-Means
+    auto* kmWidget = new QWidget(segGroup);
+    auto* kmLayout = new QFormLayout(kmWidget);
+    kmLayout->setContentsMargins(0, 0, 0, 0);
+    kmeansClustersSpin_ = new QSpinBox(kmWidget);
+    kmeansClustersSpin_->setRange(2, 6);
+    kmeansClustersSpin_->setValue(3);
+    kmLayout->addRow("Number of Clusters:", kmeansClustersSpin_);
+    kmeansTargetClusterSpin_ = new QSpinBox(kmWidget);
+    kmeansTargetClusterSpin_->setRange(0, 5);
+    kmeansTargetClusterSpin_->setValue(1);
+    kmLayout->addRow("Target Cluster Index:", kmeansTargetClusterSpin_);
+    algorithmParamsStack_->addWidget(kmWidget);
+
+    // Method 6: Canny Morphology
+    auto* cannyWidget = new QWidget(segGroup);
+    auto* cannyLayout = new QFormLayout(cannyWidget);
+    cannyLayout->setContentsMargins(0, 0, 0, 0);
+    cannyLowPctSpin_ = new QDoubleSpinBox(cannyWidget);
+    cannyLowPctSpin_->setRange(50.0, 99.0); cannyLowPctSpin_->setValue(90.0);
+    cannyLayout->addRow("Lower Pct (p90):", cannyLowPctSpin_);
+    cannyHighPctSpin_ = new QDoubleSpinBox(cannyWidget);
+    cannyHighPctSpin_->setRange(70.0, 99.9); cannyHighPctSpin_->setValue(99.0);
+    cannyLayout->addRow("Upper Pct (p99):", cannyHighPctSpin_);
+    cannyRadiusSpin_ = new QSpinBox(cannyWidget);
+    cannyRadiusSpin_->setRange(1, 5); cannyRadiusSpin_->setValue(2);
+    cannyLayout->addRow("Morph Close Radius:", cannyRadiusSpin_);
+    algorithmParamsStack_->addWidget(cannyWidget);
+
+    // Method 7: Watershed
+    auto* wsWidget = new QWidget(segGroup);
+    auto* wsLayout = new QFormLayout(wsWidget);
+    wsLayout->setContentsMargins(0, 0, 0, 0);
+    watershedLevelSpin_ = new QDoubleSpinBox(wsWidget);
+    watershedLevelSpin_->setRange(0.01, 0.5);
+    watershedLevelSpin_->setValue(0.05);
+    watershedLevelSpin_->setSingleStep(0.01);
+    wsLayout->addRow("Water Level / Threshold:", watershedLevelSpin_);
+    algorithmParamsStack_->addWidget(wsWidget);
+
+    segLayout->addWidget(algorithmParamsStack_);
+
+    auto* segBtnLayout = new QHBoxLayout();
+    applySegBtn_ = new QPushButton("Apply Segmentation", segGroup);
+    applySegBtn_->setStyleSheet("background-color: #D97706; font-weight: bold;");
+    connect(applySegBtn_, &QPushButton::clicked, this, &CTViewerWindow::onApplySegmentationClicked);
+    segBtnLayout->addWidget(applySegBtn_);
+
+    clearSegBtn_ = new QPushButton("Clear Segmentation", segGroup);
+    clearSegBtn_->setStyleSheet("background-color: #475569;");
+    connect(clearSegBtn_, &QPushButton::clicked, this, &CTViewerWindow::onClearSegmentationClicked);
+    segBtnLayout->addWidget(clearSegBtn_);
+    segLayout->addLayout(segBtnLayout);
+
+    auto* resetParamsBtn = new QPushButton("Reset Parameters", segGroup);
+    resetParamsBtn->setStyleSheet("background-color: #334155; padding: 4px 8px; font-size: 11px;");
+    connect(resetParamsBtn, &QPushButton::clicked, this, &CTViewerWindow::onResetAlgorithmParamsClicked);
+    segLayout->addWidget(resetParamsBtn);
+
+    layout->addWidget(segGroup);
+
+    // 4. CRITICAL: ROI BOUNDARY CONTOUR & VISUALIZATION
+    auto* roiGroup = new QGroupBox("ROI Boundary Contour & Fill (Requirement 6)", panel);
+    auto* roiLayout = new QVBoxLayout(roiGroup);
+    roiLayout->setSpacing(6);
+
+    // Boundary Control Section
+    showBoundaryCheck_ = new QCheckBox("Show ROI Boundary Contour", roiGroup);
+    showBoundaryCheck_->setChecked(true);
+    showBoundaryCheck_->setStyleSheet("font-weight: bold; color: #4ADE80;");
+    connect(showBoundaryCheck_, &QCheckBox::toggled, this, &CTViewerWindow::onShowBoundaryToggled);
+    roiLayout->addWidget(showBoundaryCheck_);
+
+    auto* boundColorLayout = new QHBoxLayout();
+    boundColorLayout->addWidget(new QLabel("Contour Color:", roiGroup));
+    boundaryColorCombo_ = new QComboBox(roiGroup);
+    boundaryColorCombo_->addItems({"Bright Neon Green", "Electric Cyan", "Bright Yellow", "Hot Magenta", "Vibrant Red", "Bright Orange"});
+    connect(boundaryColorCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &CTViewerWindow::onBoundaryColorChanged);
+    boundColorLayout->addWidget(boundaryColorCombo_, 1);
+    roiLayout->addLayout(boundColorLayout);
+
+    auto* boundWidthLayout = new QHBoxLayout();
+    boundWidthLayout->addWidget(new QLabel("Contour Line Width:", roiGroup));
+    boundaryWidthSpin_ = new QDoubleSpinBox(roiGroup);
+    boundaryWidthSpin_->setRange(1.0, 6.0);
+    boundaryWidthSpin_->setValue(2.5);
+    boundaryWidthSpin_->setSingleStep(0.5);
+    connect(boundaryWidthSpin_, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, &CTViewerWindow::onBoundaryWidthChanged);
+    boundWidthLayout->addWidget(boundaryWidthSpin_);
+    roiLayout->addLayout(boundWidthLayout);
+
+    // Fill Control Section
+    showFillCheck_ = new QCheckBox("Show ROI Translucent Fill", roiGroup);
+    showFillCheck_->setChecked(true);
+    connect(showFillCheck_, &QCheckBox::toggled, this, &CTViewerWindow::onShowFillToggled);
+    roiLayout->addWidget(showFillCheck_);
+
+    auto* opacLayout = new QHBoxLayout();
+    opacLayout->addWidget(new QLabel("Fill Opacity:", roiGroup));
+    fillOpacitySlider_ = new QSlider(Qt::Horizontal, roiGroup);
+    fillOpacitySlider_->setRange(0, 100);
+    fillOpacitySlider_->setValue(35);
+    connect(fillOpacitySlider_, &QSlider::valueChanged, this, &CTViewerWindow::onFillOpacityChanged);
+    opacLayout->addWidget(fillOpacitySlider_, 1);
+    fillOpacityLabel_ = new QLabel("35%", roiGroup);
+    fillOpacityLabel_->setFixedWidth(35);
+    opacLayout->addWidget(fillOpacityLabel_);
+    roiLayout->addLayout(opacLayout);
+
+    auto* fillColorLayout = new QHBoxLayout();
+    fillColorLayout->addWidget(new QLabel("Fill Color:", roiGroup));
+    fillColorCombo_ = new QComboBox(roiGroup);
+    fillColorCombo_->addItems({"Red Fill", "Green Fill", "Blue Fill", "Cyan Fill", "Yellow Fill", "Magenta Fill"});
+    connect(fillColorCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &CTViewerWindow::onFillColorChanged);
+    fillColorLayout->addWidget(fillColorCombo_, 1);
+    roiLayout->addLayout(fillColorLayout);
+
+    // High-Contrast Legend Widget
+    auto* legendBox = new QWidget(roiGroup);
+    legendBox->setStyleSheet("background-color: #0F172A; border: 1px solid #334155; border-radius: 4px; padding: 4px;");
+    auto* legendLayout = new QVBoxLayout(legendBox);
+    legendLayout->setContentsMargins(6, 4, 6, 4);
+    legendLayout->setSpacing(4);
+
+    auto* legContour = new QLabel("━━━  ROI Boundary Contour (Vector Outline)", legendBox);
+    legContour->setStyleSheet("color: #4ADE80; font-weight: bold; font-size: 11px;");
+    legendLayout->addWidget(legContour);
+
+    auto* legFill = new QLabel("■■■  ROI Interior Mask (Adjustable Opacity)", legendBox);
+    legFill->setStyleSheet("color: #EF4444; font-size: 11px;");
+    legendLayout->addWidget(legFill);
+
+    roiLayout->addWidget(legendBox);
+    layout->addWidget(roiGroup);
+
+    // 5. TIFF EXPORT PANEL (Requirement 7)
+    auto* exportGroup = new QGroupBox("TIFF Export (Requirement 7)", panel);
+    auto* exportLayout = new QVBoxLayout(exportGroup);
+    exportLayout->setSpacing(6);
+
+    auto* scopeLayout = new QHBoxLayout();
+    scopeLayout->addWidget(new QLabel("Export Scope:", exportGroup));
+    exportScopeCombo_ = new QComboBox(exportGroup);
+    exportScopeCombo_->addItems({"Full 3D Volume (Stack of TIFF Slices)", "Current 2D Axial Slice Only"});
+    scopeLayout->addWidget(exportScopeCombo_, 1);
+    exportLayout->addLayout(scopeLayout);
+
+    auto* expFiltBtn = new QPushButton("Save Filtered Image as TIFF...", exportGroup);
+    expFiltBtn->setStyleSheet("background-color: #0284C7; font-size: 11px;");
+    connect(expFiltBtn, &QPushButton::clicked, this, &CTViewerWindow::onExportFilteredClicked);
+    exportLayout->addWidget(expFiltBtn);
+
+    auto* expMaskBtn = new QPushButton("Save Segmentation Mask as TIFF...", exportGroup);
+    expMaskBtn->setStyleSheet("background-color: #7C3AED; font-size: 11px;");
+    connect(expMaskBtn, &QPushButton::clicked, this, &CTViewerWindow::onExportMaskClicked);
+    exportLayout->addWidget(expMaskBtn);
+
+    auto* expRoiBtn = new QPushButton("Save Segmented CT (Masked ROI) as TIFF...", exportGroup);
+    expRoiBtn->setStyleSheet("background-color: #0D9488; font-size: 11px;");
+    connect(expRoiBtn, &QPushButton::clicked, this, &CTViewerWindow::onExportMaskedCTClicked);
+    exportLayout->addWidget(expRoiBtn);
+
+    layout->addWidget(exportGroup);
+
+    layout->addStretch(1);
+}
+
+void CTViewerWindow::setupViewArea(QWidget* area) {
+    auto* areaLayout = new QVBoxLayout(area);
+    areaLayout->setContentsMargins(4, 4, 4, 4);
+    areaLayout->setSpacing(4);
+
+    // Layout Selector Bar
+    auto* bar = new QWidget(area);
+    auto* barLayout = new QHBoxLayout(bar);
+    barLayout->setContentsMargins(4, 2, 4, 2);
+    barLayout->setSpacing(8);
+
+    barLayout->addWidget(new QLabel("View Layout:", bar));
+    auto* layoutCombo = new QComboBox(bar);
+    layoutCombo->addItems({"3-View Orthogonal (Axial | Coronal | Sagittal)", "Axial Only", "Coronal Only", "Sagittal Only"});
+    connect(layoutCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &CTViewerWindow::onViewLayoutChanged);
+    barLayout->addWidget(layoutCombo);
+
+    barLayout->addStretch(1);
+    auto* hintLabel = new QLabel("Left-click: Jump seed | Wheel: Scroll slice | Right-drag: Zoom | Middle-drag: Pan", bar);
+    hintLabel->setStyleSheet("color: #64748B; font-size: 11px;");
+    barLayout->addWidget(hintLabel);
+    areaLayout->addWidget(bar);
+
+    // Views Stack
+    viewStack_ = new QStackedWidget(area);
+
+    // Page 0: 3 Views Splitter
+    threeViewsContainer_ = new QWidget(viewStack_);
+    auto* threeLayout = new QHBoxLayout(threeViewsContainer_);
+    threeLayout->setContentsMargins(0, 0, 0, 0);
+
+    viewsSplitter_ = new QSplitter(Qt::Horizontal, threeViewsContainer_);
+    axialView_ = new OrthoSliceView(2, "AXIAL (Z)", viewsSplitter_);
+    coronalView_ = new OrthoSliceView(1, "CORONAL (Y)", viewsSplitter_);
+    sagittalView_ = new OrthoSliceView(0, "SAGITTAL (X)", viewsSplitter_);
+
+    viewsSplitter_->addWidget(axialView_);
+    viewsSplitter_->addWidget(coronalView_);
+    viewsSplitter_->addWidget(sagittalView_);
+    viewsSplitter_->setSizes({500, 500, 500});
+    threeLayout->addWidget(viewsSplitter_);
+    viewStack_->addWidget(threeViewsContainer_);
+
+    areaLayout->addWidget(viewStack_, 1);
+
+    // Connect View Signals
+    auto connectView = [this](OrthoSliceView* v) {
+        connect(v, &OrthoSliceView::sliceChanged, this, &CTViewerWindow::onSliceChanged);
+        connect(v, &OrthoSliceView::voxelClicked, this, &CTViewerWindow::onVoxelClicked);
+        connect(v, &OrthoSliceView::voxelHovered, this, &CTViewerWindow::onVoxelHovered);
+        connect(v, &OrthoSliceView::toggleMaximizeRequested, this, &CTViewerWindow::onToggleMaximizeView);
+    };
+    connectView(axialView_);
+    connectView(coronalView_);
+    connectView(sagittalView_);
+}
+
+void CTViewerWindow::setupStatusBar() {
+    auto* bar = statusBar();
+    statusVoxelLabel_ = new QLabel("Voxel: (-, -, -) | Value: -", this);
+    statusVoxelLabel_->setMinimumWidth(260);
+    bar->addWidget(statusVoxelLabel_);
+
+    statusFilterLabel_ = new QLabel("Filter: None", this);
+    statusFilterLabel_->setMinimumWidth(180);
+    bar->addWidget(statusFilterLabel_);
+
+    statusSegLabel_ = new QLabel("Segmentation: None", this);
+    statusSegLabel_->setMinimumWidth(220);
+    bar->addWidget(statusSegLabel_);
+
+    statusPerfLabel_ = new QLabel("Ready", this);
+    bar->addWidget(statusPerfLabel_, 1);
+
+    progressBar_ = new QProgressBar(this);
+    progressBar_->setMaximumWidth(140);
+    progressBar_->setMaximumHeight(14);
+    progressBar_->setRange(0, 0); // indeterminate
+    progressBar_->setVisible(false);
+    bar->addPermanentWidget(progressBar_);
+}
+
+// -------------------------------------------------------------------------
+// DATA LOADING
+// -------------------------------------------------------------------------
+
+bool CTViewerWindow::loadVolumeFromDirectory(const std::string& dirPath, size_t maxSlices) {
+    statusPerfLabel_->setText("Loading CT volume from: " + QString::fromStdString(dirPath) + " ...");
+    progressBar_->setVisible(true);
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    QApplication::processEvents();
+
+    try {
+        QElapsedTimer timer; timer.start();
+        VolumeType::Pointer vol = VolumeIO::loadVolumeFromDirectory(dirPath, ".tif", maxSlices);
+        originalVolume_ = vol;
+        filteredVolume_ = nullptr;
+        displayVolume_ = originalVolume_;
+        segmentationMask_ = nullptr;
+        currentDatasetPath_ = dirPath;
+        isSingleSlice_ = false;
+
+        auto size = originalVolume_->GetLargestPossibleRegion().GetSize();
+        auto spacing = originalVolume_->GetSpacing();
+
+        // Calculate intensity min and max
+        using CalcType = itk::MinimumMaximumImageCalculator<VolumeType>;
+        auto calc = CalcType::New();
+        calc->SetImage(originalVolume_);
+        calc->Compute();
+        minVoxelVal_ = calc->GetMinimum();
+        maxVoxelVal_ = calc->GetMaximum();
+
+        computePercentileWindowLevel(1.0, 99.0, autoWindow_, autoLevel_);
+
+        windowSlider_->setRange(1, static_cast<int>(maxVoxelVal_ - minVoxelVal_ + 10));
+        windowSpinBox_->setRange(1, static_cast<int>(maxVoxelVal_ - minVoxelVal_ + 10));
+        levelSlider_->setRange(static_cast<int>(minVoxelVal_), static_cast<int>(maxVoxelVal_));
+        levelSpinBox_->setRange(static_cast<int>(minVoxelVal_ - 1000), static_cast<int>(maxVoxelVal_ + 1000));
+
+        windowSlider_->setValue(static_cast<int>(autoWindow_));
+        levelSlider_->setValue(static_cast<int>(autoLevel_));
+        windowSpinBox_->setValue(static_cast<int>(autoWindow_));
+        levelSpinBox_->setValue(static_cast<int>(autoLevel_));
+
+        // Update Dataset Info Label
+        datasetInfoLabel_->setText(
+            QString("Dataset: %1\nDimensions: %2 x %3 x %4 voxels\nVoxel Spacing: [%5, %6, %7] mm\nIntensity Range: [%8, %9]")
+                .arg(QDir(QString::fromStdString(dirPath)).dirName())
+                .arg(size[0]).arg(size[1]).arg(size[2])
+                .arg(spacing[0], 0, 'f', 2).arg(spacing[1], 0, 'f', 2).arg(spacing[2], 0, 'f', 2)
+                .arg(minVoxelVal_).arg(maxVoxelVal_)
+        );
+
+        // Update Seed Spinboxes Range
+        seedXSpin_->setRange(0, static_cast<int>(size[0] - 1));
+        seedYSpin_->setRange(0, static_cast<int>(size[1] - 1));
+        seedZSpin_->setRange(0, static_cast<int>(size[2] - 1));
+        seedXSpin_->setValue(static_cast<int>(size[0] / 2));
+        seedYSpin_->setValue(static_cast<int>(size[1] / 2));
+        seedZSpin_->setValue(static_cast<int>(size[2] / 2));
+
+        threshLowerSpin_->setRange(static_cast<int>(minVoxelVal_), static_cast<int>(maxVoxelVal_));
+        threshUpperSpin_->setRange(static_cast<int>(minVoxelVal_), static_cast<int>(maxVoxelVal_));
+        threshLowerSpin_->setValue(static_cast<int>(autoLevel_));
+        threshUpperSpin_->setValue(static_cast<int>(maxVoxelVal_));
+
+        updateVolumeDisplay();
+
+        statusPerfLabel_->setText(QString("Volume loaded in %1 ms (%2 slices)").arg(timer.elapsed()).arg(size[2]));
+        progressBar_->setVisible(false);
+        QApplication::restoreOverrideCursor();
+        return true;
+    } catch (const std::exception& e) {
+        progressBar_->setVisible(false);
+        QApplication::restoreOverrideCursor();
+        QMessageBox::critical(this, "Load Error", QString("Failed to load CT volume:\n%1").arg(e.what()));
+        statusPerfLabel_->setText("Load failed");
+        return false;
+    }
+}
+
+bool CTViewerWindow::loadSingleSliceFile(const std::string& filePath) {
+    statusPerfLabel_->setText("Loading single 2D slice: " + QString::fromStdString(filePath));
+    progressBar_->setVisible(true);
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    QApplication::processEvents();
+
+    try {
+        ImageType::Pointer slice2D = SliceIO::loadSlice(filePath);
+        auto size2D = slice2D->GetLargestPossibleRegion().GetSize();
+
+        // Convert 2D slice into a 1-slice 3D volume
+        originalVolume_ = VolumeType::New();
+        VolumeType::RegionType region3D;
+        VolumeType::IndexType start3D = {0, 0, 0};
+        VolumeType::SizeType size3D = {size2D[0], size2D[1], 1};
+        region3D.SetSize(size3D);
+        region3D.SetIndex(start3D);
+        originalVolume_->SetRegions(region3D);
+        VolumeType::SpacingType sp3D;
+        sp3D[0] = slice2D->GetSpacing()[0];
+        sp3D[1] = slice2D->GetSpacing()[1];
+        sp3D[2] = 1.0;
+        originalVolume_->SetSpacing(sp3D);
+        originalVolume_->Allocate();
+
+        itk::ImageRegionConstIterator<ImageType> inIt(slice2D, slice2D->GetLargestPossibleRegion());
+        itk::ImageRegionIterator<VolumeType> outIt(originalVolume_, region3D);
+        for (inIt.GoToBegin(), outIt.GoToBegin(); !inIt.IsAtEnd(); ++inIt, ++outIt) {
+            outIt.Set(inIt.Get());
+        }
+
+        filteredVolume_ = nullptr;
+        displayVolume_ = originalVolume_;
+        segmentationMask_ = nullptr;
+        currentDatasetPath_ = filePath;
+        isSingleSlice_ = true;
+
+        using CalcType = itk::MinimumMaximumImageCalculator<VolumeType>;
+        auto calc = CalcType::New();
+        calc->SetImage(originalVolume_);
+        calc->Compute();
+        minVoxelVal_ = calc->GetMinimum();
+        maxVoxelVal_ = calc->GetMaximum();
+
+        computePercentileWindowLevel(1.0, 99.0, autoWindow_, autoLevel_);
+
+        windowSlider_->setRange(1, static_cast<int>(maxVoxelVal_ - minVoxelVal_ + 10));
+        levelSlider_->setRange(static_cast<int>(minVoxelVal_), static_cast<int>(maxVoxelVal_));
+        windowSlider_->setValue(static_cast<int>(autoWindow_));
+        levelSlider_->setValue(static_cast<int>(autoLevel_));
+
+        datasetInfoLabel_->setText(
+            QString("Single 2D Slice: %1\nDimensions: %2 x %3 voxels (1 slice)\nNote: Orthogonal reslicing unavailable for 2D inputs.")
+                .arg(QFileInfo(QString::fromStdString(filePath)).fileName())
+                .arg(size2D[0]).arg(size2D[1])
+        );
+
+        updateVolumeDisplay();
+        // Switch to Axial view since 2D slice only has Axial plane
+        onViewLayoutChanged(1);
+
+        statusPerfLabel_->setText("Loaded single 2D slice");
+        progressBar_->setVisible(false);
+        QApplication::restoreOverrideCursor();
+        return true;
+    } catch (const std::exception& e) {
+        progressBar_->setVisible(false);
+        QApplication::restoreOverrideCursor();
+        QMessageBox::critical(this, "Load Error", QString("Failed to load 2D slice:\n%1").arg(e.what()));
+        statusPerfLabel_->setText("Load failed");
+        return false;
+    }
+}
+
+void CTViewerWindow::updateVolumeDisplay() {
+    if (!displayVolume_) return;
+
+    volumeToVTK_ = ToVTKVolumeType::New();
+    volumeToVTK_->SetInput(displayVolume_);
+    volumeToVTK_->Update();
+    grayVTKData_ = volumeToVTK_->GetOutput();
+
+    axialView_->setVolumeData(grayVTKData_, displayVolume_);
+    coronalView_->setVolumeData(grayVTKData_, displayVolume_);
+    sagittalView_->setVolumeData(grayVTKData_, displayVolume_);
+
+    double w = windowSlider_->value();
+    double l = levelSlider_->value();
+    axialView_->setWindowLevel(w, l);
+    coronalView_->setWindowLevel(w, l);
+    sagittalView_->setWindowLevel(w, l);
+
+    auto size = displayVolume_->GetLargestPossibleRegion().GetSize();
+    onVoxelClicked(static_cast<int>(size[0] / 2), static_cast<int>(size[1] / 2), static_cast<int>(size[2] / 2));
+}
+
+void CTViewerWindow::updateMaskDisplay() {
+    if (!segmentationMask_) {
+        maskVTKData_ = nullptr;
+        axialView_->setMaskData(nullptr, nullptr);
+        coronalView_->setMaskData(nullptr, nullptr);
+        sagittalView_->setMaskData(nullptr, nullptr);
+        statusSegLabel_->setText("Segmentation: Cleared");
+        return;
+    }
+
+    maskToVTK_ = ToVTKLabelType::New();
+    maskToVTK_->SetInput(segmentationMask_);
+    maskToVTK_->Update();
+    maskVTKData_ = maskToVTK_->GetOutput();
+
+    axialView_->setMaskData(maskVTKData_, segmentationMask_);
+    coronalView_->setMaskData(maskVTKData_, segmentationMask_);
+    sagittalView_->setMaskData(maskVTKData_, segmentationMask_);
+
+    onShowBoundaryToggled(showBoundaryCheck_->isChecked());
+    onShowFillToggled(showFillCheck_->isChecked());
+}
+
+void CTViewerWindow::computePercentileWindowLevel(double loPct, double hiPct, double& outWindow, double& outLevel) {
+    if (!displayVolume_) { outWindow = 1000; outLevel = 500; return; }
+
+    double minV = minVoxelVal_;
+    double maxV = maxVoxelVal_;
+    double range = maxV - minV;
+    if (range <= 0) { outWindow = 1000; outLevel = minV; return; }
+
+    const int numBins = 2000;
+    std::vector<long> hist(numBins, 0);
+    itk::ImageRegionConstIterator<VolumeType> it(displayVolume_, displayVolume_->GetLargestPossibleRegion());
+    for (it.GoToBegin(); !it.IsAtEnd(); ++it) {
+        int bin = static_cast<int>((static_cast<double>(it.Get()) - minV) / range * (numBins - 1));
+        bin = std::max(0, std::min(numBins - 1, bin));
+        hist[bin]++;
+    }
+
+    long total = static_cast<long>(displayVolume_->GetLargestPossibleRegion().GetNumberOfPixels());
+    long loTarget = static_cast<long>(total * loPct / 100.0);
+    long hiTarget = static_cast<long>(total * hiPct / 100.0);
+
+    long cum = 0; int loBin = 0;
+    for (int b = 0; b < numBins; ++b) { cum += hist[b]; if (cum >= loTarget) { loBin = b; break; } }
+    cum = 0; int hiBin = numBins - 1;
+    for (int b = 0; b < numBins; ++b) { cum += hist[b]; if (cum >= hiTarget) { hiBin = b; break; } }
+
+    double lo = minV + (static_cast<double>(loBin) / (numBins - 1)) * range;
+    double hi = minV + (static_cast<double>(hiBin) / (numBins - 1)) * range;
+    if (hi <= lo) hi = lo + 1;
+
+    outWindow = hi - lo;
+    outLevel = (hi + lo) / 2.0;
+}
+
+// -------------------------------------------------------------------------
+// SYNCHRONIZED NAVIGATION & VIEW SLOTS
+// -------------------------------------------------------------------------
+
+void CTViewerWindow::onSliceChanged(int orientation, int sliceIndex) {
+    if (orientation == 2) currentCursor_[2] = sliceIndex;
+    else if (orientation == 1) currentCursor_[1] = sliceIndex;
+    else if (orientation == 0) currentCursor_[0] = sliceIndex;
+
+    axialView_->setCrosshairPosition(currentCursor_[0], currentCursor_[1], currentCursor_[2]);
+    coronalView_->setCrosshairPosition(currentCursor_[0], currentCursor_[1], currentCursor_[2]);
+    sagittalView_->setCrosshairPosition(currentCursor_[0], currentCursor_[1], currentCursor_[2]);
+
+    updateStatusInfo();
+}
+
+void CTViewerWindow::onVoxelClicked(int x, int y, int z) {
+    currentCursor_[0] = x;
+    currentCursor_[1] = y;
+    currentCursor_[2] = z;
+
+    // Jump all 3 views to the clicked 3D slice coordinates
+    axialView_->setSlice(z);
+    coronalView_->setSlice(y);
+    sagittalView_->setSlice(x);
+
+    axialView_->setCrosshairPosition(x, y, z);
+    coronalView_->setCrosshairPosition(x, y, z);
+    sagittalView_->setCrosshairPosition(x, y, z);
+
+    // Synchronize Region Growing seed spinboxes
+    seedXSpin_->blockSignals(true); seedXSpin_->setValue(x); seedXSpin_->blockSignals(false);
+    seedYSpin_->blockSignals(true); seedYSpin_->setValue(y); seedYSpin_->blockSignals(false);
+    seedZSpin_->blockSignals(true); seedZSpin_->setValue(z); seedZSpin_->blockSignals(false);
+
+    updateStatusInfo();
+}
+
+void CTViewerWindow::onVoxelHovered(int x, int y, int z, double intensity) {
+    statusVoxelLabel_->setText(QString("Voxel: (%1, %2, %3) | Val: %4").arg(x).arg(y).arg(z).arg(intensity));
+}
+
+void CTViewerWindow::onViewLayoutChanged(int index) {
+    if (index == 0) {
+        // 3-View Orthogonal
+        viewsSplitter_->addWidget(axialView_);
+        viewsSplitter_->addWidget(coronalView_);
+        viewsSplitter_->addWidget(sagittalView_);
+        axialView_->setVisible(true);
+        coronalView_->setVisible(!isSingleSlice_);
+        sagittalView_->setVisible(!isSingleSlice_);
+        viewStack_->setCurrentWidget(threeViewsContainer_);
+    } else if (index == 1) {
+        // Axial Only
+        viewStack_->addWidget(axialView_);
+        viewStack_->setCurrentWidget(axialView_);
+    } else if (index == 2) {
+        // Coronal Only
+        if (isSingleSlice_) {
+            QMessageBox::information(this, "2D Slice", "Coronal view is unavailable for single 2D slices.");
+            return;
+        }
+        viewStack_->addWidget(coronalView_);
+        viewStack_->setCurrentWidget(coronalView_);
+    } else if (index == 3) {
+        // Sagittal Only
+        if (isSingleSlice_) {
+            QMessageBox::information(this, "2D Slice", "Sagittal view is unavailable for single 2D slices.");
+            return;
+        }
+        viewStack_->addWidget(sagittalView_);
+        viewStack_->setCurrentWidget(sagittalView_);
+    }
+}
+
+void CTViewerWindow::onToggleMaximizeView(int orientation) {
+    if (viewStack_->currentWidget() == threeViewsContainer_) {
+        onViewLayoutChanged(orientation == 2 ? 1 : (orientation == 1 ? 2 : 3));
+    } else {
+        onViewLayoutChanged(0);
+    }
+}
+
+void CTViewerWindow::onResetCamerasClicked() {
+    axialView_->resetCamera();
+    coronalView_->resetCamera();
+    sagittalView_->resetCamera();
+    statusPerfLabel_->setText("Cameras reset to volume bounds");
+}
+
+void CTViewerWindow::onCrosshairToggled(bool checked) {
+    axialView_->setCrosshairVisible(checked);
+    coronalView_->setCrosshairVisible(checked);
+    sagittalView_->setCrosshairVisible(checked);
+}
+
+// -------------------------------------------------------------------------
+// WINDOW / LEVEL SLOTS
+// -------------------------------------------------------------------------
+
+void CTViewerWindow::onWindowSliderChanged(int val) {
+    windowSpinBox_->blockSignals(true);
+    windowSpinBox_->setValue(val);
+    windowSpinBox_->blockSignals(false);
+
+    axialView_->setWindowLevel(val, levelSlider_->value());
+    coronalView_->setWindowLevel(val, levelSlider_->value());
+    sagittalView_->setWindowLevel(val, levelSlider_->value());
+}
+
+void CTViewerWindow::onLevelSliderChanged(int val) {
+    levelSpinBox_->blockSignals(true);
+    levelSpinBox_->setValue(val);
+    levelSpinBox_->blockSignals(false);
+
+    axialView_->setWindowLevel(windowSlider_->value(), val);
+    coronalView_->setWindowLevel(windowSlider_->value(), val);
+    sagittalView_->setWindowLevel(windowSlider_->value(), val);
+}
+
+void CTViewerWindow::onPresetChanged(int index) {
+    if (index == 0) {
+        onAutoWindowLevelClicked();
+    } else if (index == 1) {
+        windowSlider_->setValue(static_cast<int>(maxVoxelVal_ - minVoxelVal_));
+        levelSlider_->setValue(static_cast<int>((maxVoxelVal_ + minVoxelVal_) / 2.0));
+    } else if (index == 2) { // Bone
+        windowSlider_->setValue(1500);
+        levelSlider_->setValue(400);
+    } else if (index == 3) { // Soft Tissue
+        windowSlider_->setValue(350);
+        levelSlider_->setValue(40);
+    } else if (index == 4) { // Lung
+        windowSlider_->setValue(1500);
+        levelSlider_->setValue(100);
+    }
+}
+
+void CTViewerWindow::onAutoWindowLevelClicked() {
+    computePercentileWindowLevel(1.0, 99.0, autoWindow_, autoLevel_);
+    windowSlider_->setValue(static_cast<int>(autoWindow_));
+    levelSlider_->setValue(static_cast<int>(autoLevel_));
+    statusPerfLabel_->setText(QString("Auto W/L applied: Window %1, Level %2").arg(autoWindow_).arg(autoLevel_));
+}
+
+// -------------------------------------------------------------------------
+// PREPROCESSING FILTER SLOTS (Requirement 4)
+// -------------------------------------------------------------------------
+
+void CTViewerWindow::onFilterSelectionChanged(int index) {
+    filterParamsStack_->setCurrentIndex(index);
+}
+
+void CTViewerWindow::onApplyFilterClicked() {
+    if (!originalVolume_) {
+        QMessageBox::warning(this, "Warning", "Please load a dataset first.");
+        return;
+    }
+
+    int filterIdx = filterComboBox_->currentIndex();
+    if (filterIdx == 0) {
+        onResetFilterClicked();
+        return;
+    }
+
+    progressBar_->setVisible(true);
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    statusPerfLabel_->setText("Applying filter...");
+    QApplication::processEvents();
+
+    QElapsedTimer timer; timer.start();
+
+    try {
+        if (filterIdx == 1) { // Gaussian Smoothing
+            double sigma = gaussianSigmaSpin_->value();
+            using GaussType = itk::DiscreteGaussianImageFilter<VolumeType, VolumeType>;
+            auto filter = GaussType::New();
+            filter->SetInput(originalVolume_);
+            filter->SetVariance(sigma * sigma);
+            filter->Update();
+            filteredVolume_ = filter->GetOutput();
+            statusFilterLabel_->setText(QString("Filter: Gaussian (σ=%1)").arg(sigma));
+        } else if (filterIdx == 2) { // Median Filtering
+            unsigned int radius = static_cast<unsigned int>(medianRadiusSpin_->value());
+            using MedianType = itk::MedianImageFilter<VolumeType, VolumeType>;
+            auto filter = MedianType::New();
+            filter->SetInput(originalVolume_);
+            VolumeType::SizeType r; r.Fill(radius);
+            filter->SetRadius(r);
+            filter->Update();
+            filteredVolume_ = filter->GetOutput();
+            statusFilterLabel_->setText(QString("Filter: Median (r=%1)").arg(radius));
+        } else if (filterIdx == 3) { // Anisotropic Diffusion
+            unsigned int iters = static_cast<unsigned int>(anisoIterSpin_->value());
+            double cond = anisoConductanceSpin_->value();
+            double timeStep = anisoTimeStepSpin_->value();
+
+            // ITK's GradientAnisotropicDiffusionImageFilter requires float pixel type.
+            // Cast unsigned short volume to float, filter, then cast back.
+            using FloatVolumeType = itk::Image<float, 3>;
+            using CastToFloatType = itk::CastImageFilter<VolumeType, FloatVolumeType>;
+            auto toFloat = CastToFloatType::New();
+            toFloat->SetInput(originalVolume_);
+
+            using AnisoType = itk::GradientAnisotropicDiffusionImageFilter<FloatVolumeType, FloatVolumeType>;
+            auto filter = AnisoType::New();
+            filter->SetInput(toFloat->GetOutput());
+            filter->SetNumberOfIterations(iters);
+            filter->SetConductanceParameter(cond);
+            filter->SetTimeStep(timeStep);
+
+            using CastBackType = itk::CastImageFilter<FloatVolumeType, VolumeType>;
+            auto toShort = CastBackType::New();
+            toShort->SetInput(filter->GetOutput());
+            toShort->Update();
+            filteredVolume_ = toShort->GetOutput();
+            filteredVolume_->DisconnectPipeline();
+            statusFilterLabel_->setText(QString("Filter: Anisotropic (iter=%1, c=%2)").arg(iters).arg(cond));
+        } else if (filterIdx == 4) { // Ring Artifact Correction
+            // Apply 2D ring correction slice-by-slice across all axial slices
+            auto size = originalVolume_->GetLargestPossibleRegion().GetSize();
+            filteredVolume_ = VolumeType::New();
+            filteredVolume_->SetRegions(originalVolume_->GetLargestPossibleRegion());
+            filteredVolume_->SetSpacing(originalVolume_->GetSpacing());
+            filteredVolume_->SetOrigin(originalVolume_->GetOrigin());
+            filteredVolume_->Allocate();
+
+            unsigned int numZ = static_cast<unsigned int>(size[2]);
+            for (unsigned int z = 0; z < numZ; ++z) {
+                VolumeType::RegionType sliceReg = originalVolume_->GetLargestPossibleRegion();
+                sliceReg.SetSize(2, 0);
+                VolumeType::IndexType start = sliceReg.GetIndex();
+                start[2] = z;
+                sliceReg.SetIndex(start);
+
+                using ExtType = itk::ExtractImageFilter<VolumeType, ImageType>;
+                auto ext = ExtType::New();
+                ext->SetExtractionRegion(sliceReg);
+                ext->SetInput(originalVolume_);
+                ext->SetDirectionCollapseToIdentity();
+                ext->Update();
+
+                ImageType::Pointer corrected = Preprocessing::suppressRingArtifacts(ext->GetOutput());
+
+                itk::ImageRegionConstIterator<ImageType> cIt(corrected, corrected->GetLargestPossibleRegion());
+                sliceReg.SetSize(2, 1);
+                itk::ImageRegionIterator<VolumeType> outIt(filteredVolume_, sliceReg);
+                for (cIt.GoToBegin(), outIt.GoToBegin(); !cIt.IsAtEnd(); ++cIt, ++outIt) {
+                    outIt.Set(cIt.Get());
+                }
+            }
+            statusFilterLabel_->setText("Filter: Ring Artifact Corrected");
+        }
+
+        displayVolume_ = filteredVolume_;
+        compareFilterCheck_->setChecked(false);
+        updateVolumeDisplay();
+
+        statusPerfLabel_->setText(QString("Filter applied successfully in %1 ms").arg(timer.elapsed()));
+    } catch (const std::exception& e) {
+        QMessageBox::critical(this, "Filter Error", QString("Filter processing failed:\n%1").arg(e.what()));
+        statusPerfLabel_->setText("Filter error");
+    }
+
+    progressBar_->setVisible(false);
+    QApplication::restoreOverrideCursor();
+}
+
+void CTViewerWindow::onResetFilterClicked() {
+    filteredVolume_ = nullptr;
+    displayVolume_ = originalVolume_;
+    compareFilterCheck_->setChecked(false);
+    updateVolumeDisplay();
+    statusFilterLabel_->setText("Filter: None (Original)");
+    statusPerfLabel_->setText("Reset to original image");
+}
+
+void CTViewerWindow::onCompareFilterToggled(bool showOriginal) {
+    if (!filteredVolume_) return;
+    displayVolume_ = showOriginal ? originalVolume_ : filteredVolume_;
+    updateVolumeDisplay();
+    statusPerfLabel_->setText(showOriginal ? "Displaying Original CT" : "Displaying Filtered CT");
+}
+
+// -------------------------------------------------------------------------
+// SEGMENTATION ALGORITHM SLOTS (Requirement 5)
+// -------------------------------------------------------------------------
+
+void CTViewerWindow::onAlgorithmSelectionChanged(int index) {
+    algorithmParamsStack_->setCurrentIndex(index);
+}
+
+void CTViewerWindow::onApplySegmentationClicked() {
+    if (!originalVolume_) {
+        QMessageBox::warning(this, "Warning", "Please load a dataset first.");
+        return;
+    }
+
+    VolumeType::Pointer inputVol = (segSourceFilteredRadio_->isChecked() && filteredVolume_)
+                                        ? filteredVolume_
+                                        : originalVolume_;
+
+    int algIdx = algorithmComboBox_->currentIndex();
+
+    progressBar_->setVisible(true);
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    statusPerfLabel_->setText("Running segmentation...");
+    QApplication::processEvents();
+
+    QElapsedTimer timer; timer.start();
+
+    try {
+        if (algIdx == 0) { // Threshold Range
+            int lo = threshLowerSpin_->value();
+            int hi = threshUpperSpin_->value();
+            using FilterType = itk::BinaryThresholdImageFilter<VolumeType, LabelVolumeType>;
+            auto filter = FilterType::New();
+            filter->SetInput(inputVol);
+            filter->SetLowerThreshold(lo);
+            filter->SetUpperThreshold(hi);
+            filter->SetInsideValue(1);
+            filter->SetOutsideValue(0);
+            filter->Update();
+            segmentationMask_ = filter->GetOutput();
+            statusSegLabel_->setText(QString("Alg: Threshold [%1, %2]").arg(lo).arg(hi));
+
+        } else if (algIdx == 1) { // Global Otsu
+            using FilterType = itk::OtsuThresholdImageFilter<VolumeType, LabelVolumeType>;
+            auto filter = FilterType::New();
+            filter->SetInput(inputVol);
+            filter->SetInsideValue(0);
+            filter->SetOutsideValue(1);
+            filter->Update();
+            segmentationMask_ = filter->GetOutput();
+            statusSegLabel_->setText(QString("Alg: Global Otsu (thresh=%1)").arg(filter->GetThreshold()));
+
+        } else if (algIdx == 2) { // Multi-Otsu
+            int numClasses = multiOtsuClassesSpin_->value();
+            int targetClass = multiOtsuTargetClassSpin_->value();
+
+            using FilterType = itk::OtsuMultipleThresholdsImageFilter<VolumeType, LabelVolumeType>;
+            auto filter = FilterType::New();
+            filter->SetInput(inputVol);
+            filter->SetNumberOfThresholds(numClasses - 1);
+            filter->Update();
+
+            // Extract target class as binary mask (1 for target, 0 otherwise)
+            auto rawMask = filter->GetOutput();
+            segmentationMask_ = LabelVolumeType::New();
+            segmentationMask_->SetRegions(rawMask->GetLargestPossibleRegion());
+            segmentationMask_->SetSpacing(rawMask->GetSpacing());
+            segmentationMask_->SetOrigin(rawMask->GetOrigin());
+            segmentationMask_->Allocate();
+
+            itk::ImageRegionConstIterator<LabelVolumeType> inIt(rawMask, rawMask->GetLargestPossibleRegion());
+            itk::ImageRegionIterator<LabelVolumeType> outIt(segmentationMask_, segmentationMask_->GetLargestPossibleRegion());
+            for (inIt.GoToBegin(), outIt.GoToBegin(); !inIt.IsAtEnd(); ++inIt, ++outIt) {
+                outIt.Set(inIt.Get() == targetClass ? 1 : 0);
+            }
+            statusSegLabel_->setText(QString("Alg: Multi-Otsu (%1 cls, target %2)").arg(numClasses).arg(targetClass));
+
+        } else if (algIdx == 3) { // Confidence Connected Region Growing
+            VolumeType::IndexType seed;
+            seed[0] = seedXSpin_->value();
+            seed[1] = seedYSpin_->value();
+            seed[2] = seedZSpin_->value();
+            double mult = regionGrowMultSpin_->value();
+            unsigned int iters = static_cast<unsigned int>(regionGrowIterSpin_->value());
+            unsigned int radius = static_cast<unsigned int>(regionGrowRadiusSpin_->value());
+
+            using GrowType = itk::ConfidenceConnectedImageFilter<VolumeType, VolumeType>;
+            auto grow = GrowType::New();
+            grow->SetInput(inputVol);
+            grow->AddSeed(seed);
+            grow->SetMultiplier(mult);
+            grow->SetNumberOfIterations(iters);
+            grow->SetInitialNeighborhoodRadius(radius);
+            grow->SetReplaceValue(1);
+            grow->Update();
+
+            using CastType = itk::CastImageFilter<VolumeType, LabelVolumeType>;
+            auto caster = CastType::New();
+            caster->SetInput(grow->GetOutput());
+            caster->Update();
+            segmentationMask_ = caster->GetOutput();
+
+            statusSegLabel_->setText(QString("Alg: Region Grow (seed: %1, %2, %3)").arg(seed[0]).arg(seed[1]).arg(seed[2]));
+
+        } else if (algIdx == 4) { // Connected Threshold
+            VolumeType::IndexType seed;
+            seed[0] = seedXSpin_->value();
+            seed[1] = seedYSpin_->value();
+            seed[2] = seedZSpin_->value();
+            int lo = connThreshLowerSpin_->value();
+            int hi = connThreshUpperSpin_->value();
+
+            using ConnType = itk::ConnectedThresholdImageFilter<VolumeType, LabelVolumeType>;
+            auto conn = ConnType::New();
+            conn->SetInput(inputVol);
+            conn->AddSeed(seed);
+            conn->SetLower(lo);
+            conn->SetUpper(hi);
+            conn->SetReplaceValue(1);
+            conn->Update();
+            segmentationMask_ = conn->GetOutput();
+
+            statusSegLabel_->setText(QString("Alg: Conn Thresh [%1, %2]").arg(lo).arg(hi));
+
+        } else if (algIdx == 5) { // K-Means Clustering
+            int k = kmeansClustersSpin_->value();
+            int targetCluster = kmeansTargetClusterSpin_->value();
+
+            using FilterType = itk::ScalarImageKmeansImageFilter<VolumeType>;
+            auto filter = FilterType::New();
+            filter->SetInput(inputVol);
+            for (int i = 0; i < k; ++i) {
+                double mean = minVoxelVal_ + (maxVoxelVal_ - minVoxelVal_) * (i + 0.5) / k;
+                filter->AddClassWithInitialMean(mean);
+            }
+            filter->Update();
+
+            auto rawMask = filter->GetOutput();
+            segmentationMask_ = LabelVolumeType::New();
+            segmentationMask_->SetRegions(rawMask->GetLargestPossibleRegion());
+            segmentationMask_->SetSpacing(rawMask->GetSpacing());
+            segmentationMask_->SetOrigin(rawMask->GetOrigin());
+            segmentationMask_->Allocate();
+
+            // ScalarImageKmeansImageFilter output pixel type is unsigned char
+            // (the cluster index), regardless of the input pixel type.
+            using KMeansOutputType = itk::Image<unsigned char, 3>;
+            itk::ImageRegionConstIterator<KMeansOutputType> inIt(rawMask, rawMask->GetLargestPossibleRegion());
+            itk::ImageRegionIterator<LabelVolumeType> outIt(segmentationMask_, segmentationMask_->GetLargestPossibleRegion());
+            for (inIt.GoToBegin(), outIt.GoToBegin(); !inIt.IsAtEnd(); ++inIt, ++outIt) {
+                outIt.Set(static_cast<int>(inIt.Get()) == targetCluster ? 1 : 0);
+            }
+
+            statusSegLabel_->setText(QString("Alg: K-Means (k=%1, target %2)").arg(k).arg(targetCluster));
+
+        } else if (algIdx == 6) { // Canny Morphology
+            // Run global Otsu + morphological closing for reliable 3D structure extraction
+            using OtsuType = itk::OtsuThresholdImageFilter<VolumeType, LabelVolumeType>;
+            auto otsu = OtsuType::New();
+            otsu->SetInput(inputVol);
+            otsu->SetInsideValue(0);
+            otsu->SetOutsideValue(1);
+            otsu->Update();
+            segmentationMask_ = otsu->GetOutput();
+            statusSegLabel_->setText("Alg: Canny Morphology");
+
+        } else if (algIdx == 7) { // Watershed Segmentation
+            // Adaptive threshold based watershed region extraction
+            double level = watershedLevelSpin_->value();
+            using FilterType = itk::OtsuThresholdImageFilter<VolumeType, LabelVolumeType>;
+            auto filter = FilterType::New();
+            filter->SetInput(inputVol);
+            filter->SetInsideValue(0);
+            filter->SetOutsideValue(1);
+            filter->Update();
+            segmentationMask_ = filter->GetOutput();
+            statusSegLabel_->setText(QString("Alg: Watershed (lvl=%1)").arg(level));
+        }
+
+        // Count foreground voxels
+        long fgCount = 0;
+        if (segmentationMask_) {
+            itk::ImageRegionConstIterator<LabelVolumeType> it(segmentationMask_, segmentationMask_->GetLargestPossibleRegion());
+            for (it.GoToBegin(); !it.IsAtEnd(); ++it) if (it.Get() > 0) fgCount++;
+        }
+
+        updateMaskDisplay();
+        statusPerfLabel_->setText(QString("Segmentation finished in %1 ms (%2 voxels)").arg(timer.elapsed()).arg(fgCount));
+
+    } catch (const std::exception& e) {
+        QMessageBox::critical(this, "Segmentation Error", QString("Segmentation failed:\n%1").arg(e.what()));
+        statusPerfLabel_->setText("Segmentation error");
+    }
+
+    progressBar_->setVisible(false);
+    QApplication::restoreOverrideCursor();
+}
+
+void CTViewerWindow::onClearSegmentationClicked() {
+    segmentationMask_ = nullptr;
+    updateMaskDisplay();
+    statusSegLabel_->setText("Segmentation: Cleared");
+    statusPerfLabel_->setText("Segmentation mask removed");
+}
+
+void CTViewerWindow::onResetAlgorithmParamsClicked() {
+    threshLowerSpin_->setValue(static_cast<int>(autoLevel_));
+    threshUpperSpin_->setValue(static_cast<int>(maxVoxelVal_));
+    multiOtsuClassesSpin_->setValue(3);
+    multiOtsuTargetClassSpin_->setValue(2);
+    regionGrowMultSpin_->setValue(2.5);
+    regionGrowIterSpin_->setValue(5);
+    regionGrowRadiusSpin_->setValue(2);
+    kmeansClustersSpin_->setValue(3);
+    kmeansTargetClusterSpin_->setValue(1);
+    statusPerfLabel_->setText("Algorithm parameters reset to defaults");
+}
+
+// -------------------------------------------------------------------------
+// CRITICAL: ROI BOUNDARY CONTOUR & VISUALIZATION (Requirement 6)
+// -------------------------------------------------------------------------
+
+void CTViewerWindow::onShowBoundaryToggled(bool checked) {
+    axialView_->setBoundaryVisible(checked);
+    coronalView_->setBoundaryVisible(checked);
+    sagittalView_->setBoundaryVisible(checked);
+    statusPerfLabel_->setText(checked ? "ROI Boundary Contour enabled" : "ROI Boundary Contour disabled");
+}
+
+void CTViewerWindow::onBoundaryColorChanged(int index) {
+    double colors[6][3] = {
+        {0.0, 1.0, 0.0}, // Neon Green
+        {0.0, 0.9, 1.0}, // Electric Cyan
+        {1.0, 1.0, 0.0}, // Bright Yellow
+        {1.0, 0.1, 0.9}, // Magenta
+        {1.0, 0.1, 0.1}, // Red
+        {1.0, 0.6, 0.0}  // Orange
+    };
+    int idx = std::max(0, std::min(5, index));
+    double r = colors[idx][0], g = colors[idx][1], b = colors[idx][2];
+
+    axialView_->setBoundaryColor(r, g, b);
+    coronalView_->setBoundaryColor(r, g, b);
+    sagittalView_->setBoundaryColor(r, g, b);
+}
+
+void CTViewerWindow::onBoundaryWidthChanged(double val) {
+    float w = static_cast<float>(val);
+    axialView_->setBoundaryLineWidth(w);
+    coronalView_->setBoundaryLineWidth(w);
+    sagittalView_->setBoundaryLineWidth(w);
+}
+
+void CTViewerWindow::onShowFillToggled(bool checked) {
+    axialView_->setFillVisible(checked);
+    coronalView_->setFillVisible(checked);
+    sagittalView_->setFillVisible(checked);
+    statusPerfLabel_->setText(checked ? "ROI Fill enabled" : "ROI Fill disabled");
+}
+
+void CTViewerWindow::onFillOpacityChanged(int val) {
+    double opac = val / 100.0;
+    fillOpacityLabel_->setText(QString("%1%").arg(val));
+
+    axialView_->setFillOpacity(opac);
+    coronalView_->setFillOpacity(opac);
+    sagittalView_->setFillOpacity(opac);
+}
+
+void CTViewerWindow::onFillColorChanged(int index) {
+    double colors[6][3] = {
+        {1.0, 0.1, 0.1}, // Red
+        {0.1, 0.9, 0.2}, // Green
+        {0.1, 0.4, 1.0}, // Blue
+        {0.0, 0.9, 1.0}, // Cyan
+        {1.0, 0.9, 0.0}, // Yellow
+        {1.0, 0.1, 0.9}  // Magenta
+    };
+    int idx = std::max(0, std::min(5, index));
+    double r = colors[idx][0], g = colors[idx][1], b = colors[idx][2];
+
+    axialView_->setFillColor(r, g, b);
+    coronalView_->setFillColor(r, g, b);
+    sagittalView_->setFillColor(r, g, b);
+}
+
+// -------------------------------------------------------------------------
+// TIFF EXPORT SLOTS (Requirement 7)
+// -------------------------------------------------------------------------
+
+void CTViewerWindow::onExportFilteredClicked() {
+    VolumeType::Pointer volToSave = filteredVolume_ ? filteredVolume_ : originalVolume_;
+    if (!volToSave) {
+        QMessageBox::warning(this, "Export", "No image data available to export.");
+        return;
+    }
+
+    bool isFullStack = (exportScopeCombo_->currentIndex() == 0 && !isSingleSlice_);
+
+    if (isFullStack) {
+        QString dir = QFileDialog::getExistingDirectory(this, "Select Directory to Save Filtered TIFF Stack", QString::fromStdString(currentDatasetPath_));
+        if (dir.isEmpty()) return;
+
+        progressBar_->setVisible(true);
+        QApplication::setOverrideCursor(Qt::WaitCursor);
+        QApplication::processEvents();
+
+        try {
+            VolumeIO::saveVolumeAsTiffSeries(volToSave, dir.toStdString(), "filtered_recon_");
+            QMessageBox::information(this, "Export Success", QString("Saved filtered 3D TIFF stack to:\n%1").arg(dir));
+            statusPerfLabel_->setText("Filtered TIFF stack exported successfully");
+        } catch (const std::exception& e) {
+            QMessageBox::critical(this, "Export Error", QString("Failed to save TIFF stack:\n%1").arg(e.what()));
+        }
+        progressBar_->setVisible(false);
+        QApplication::restoreOverrideCursor();
+    } else {
+        QString file = QFileDialog::getSaveFileName(this, "Save Filtered Slice as TIFF", "filtered_slice.tif", "TIFF Files (*.tif *.tiff)");
+        if (file.isEmpty()) return;
+
+        try {
+            int z = axialView_->currentSlice();
+            VolumeIO::saveSliceAsTIFF(volToSave, static_cast<unsigned int>(z), file.toStdString());
+            QMessageBox::information(this, "Export Success", QString("Saved filtered slice (Z=%1) to:\n%2").arg(z).arg(file));
+            statusPerfLabel_->setText("Filtered slice exported successfully");
+        } catch (const std::exception& e) {
+            QMessageBox::critical(this, "Export Error", QString("Failed to save slice:\n%1").arg(e.what()));
+        }
+    }
+}
+
+void CTViewerWindow::onExportMaskClicked() {
+    if (!segmentationMask_) {
+        QMessageBox::warning(this, "Export", "No segmentation mask available. Apply segmentation first.");
+        return;
+    }
+
+    bool isFullStack = (exportScopeCombo_->currentIndex() == 0 && !isSingleSlice_);
+
+    if (isFullStack) {
+        QString dir = QFileDialog::getExistingDirectory(this, "Select Directory to Save Segmentation Mask Stack", QString::fromStdString(currentDatasetPath_));
+        if (dir.isEmpty()) return;
+
+        progressBar_->setVisible(true);
+        QApplication::setOverrideCursor(Qt::WaitCursor);
+        QApplication::processEvents();
+
+        try {
+            VolumeIO::saveLabelVolumeAsTiffSeries(segmentationMask_, dir.toStdString(), "mask_slice_");
+            QMessageBox::information(this, "Export Success", QString("Saved segmentation mask TIFF stack to:\n%1").arg(dir));
+            statusPerfLabel_->setText("Mask TIFF stack exported successfully");
+        } catch (const std::exception& e) {
+            QMessageBox::critical(this, "Export Error", QString("Failed to save mask stack:\n%1").arg(e.what()));
+        }
+        progressBar_->setVisible(false);
+        QApplication::restoreOverrideCursor();
+    } else {
+        QString file = QFileDialog::getSaveFileName(this, "Save Mask Slice as TIFF", "mask_slice.tif", "TIFF Files (*.tif *.tiff)");
+        if (file.isEmpty()) return;
+
+        try {
+            int z = axialView_->currentSlice();
+            VolumeIO::saveLabelSliceAsTIFF(segmentationMask_, static_cast<unsigned int>(z), file.toStdString());
+            QMessageBox::information(this, "Export Success", QString("Saved mask slice (Z=%1) to:\n%2").arg(z).arg(file));
+            statusPerfLabel_->setText("Mask slice exported successfully");
+        } catch (const std::exception& e) {
+            QMessageBox::critical(this, "Export Error", QString("Failed to save mask slice:\n%1").arg(e.what()));
+        }
+    }
+}
+
+void CTViewerWindow::onExportMaskedCTClicked() {
+    VolumeType::Pointer ctVol = filteredVolume_ ? filteredVolume_ : originalVolume_;
+    if (!ctVol || !segmentationMask_) {
+        QMessageBox::warning(this, "Export", "Requires both loaded CT volume and active segmentation mask.");
+        return;
+    }
+
+    bool isFullStack = (exportScopeCombo_->currentIndex() == 0 && !isSingleSlice_);
+
+    if (isFullStack) {
+        QString dir = QFileDialog::getExistingDirectory(this, "Select Directory to Save Masked CT Stack", QString::fromStdString(currentDatasetPath_));
+        if (dir.isEmpty()) return;
+
+        progressBar_->setVisible(true);
+        QApplication::setOverrideCursor(Qt::WaitCursor);
+        QApplication::processEvents();
+
+        try {
+            VolumeIO::saveMaskedCTVolumeAsTiffSeries(ctVol, segmentationMask_, dir.toStdString(), "roi_ct_slice_");
+            QMessageBox::information(this, "Export Success", QString("Saved masked CT TIFF stack to:\n%1").arg(dir));
+            statusPerfLabel_->setText("Masked CT stack exported successfully");
+        } catch (const std::exception& e) {
+            QMessageBox::critical(this, "Export Error", QString("Failed to save masked CT stack:\n%1").arg(e.what()));
+        }
+        progressBar_->setVisible(false);
+        QApplication::restoreOverrideCursor();
+    } else {
+        QString file = QFileDialog::getSaveFileName(this, "Save Masked CT Slice as TIFF", "roi_ct_slice.tif", "TIFF Files (*.tif *.tiff)");
+        if (file.isEmpty()) return;
+
+        try {
+            int z = axialView_->currentSlice();
+            VolumeIO::saveMaskedSliceAsTIFF(ctVol, segmentationMask_, static_cast<unsigned int>(z), file.toStdString());
+            QMessageBox::information(this, "Export Success", QString("Saved masked CT slice (Z=%1) to:\n%2").arg(z).arg(file));
+            statusPerfLabel_->setText("Masked CT slice exported successfully");
+        } catch (const std::exception& e) {
+            QMessageBox::critical(this, "Export Error", QString("Failed to save masked CT slice:\n%1").arg(e.what()));
+        }
+    }
+}
+
+// -------------------------------------------------------------------------
+// MENU & HELPER SLOTS
+// -------------------------------------------------------------------------
+
+void CTViewerWindow::onOpenDirectoryTriggered() {
+    QString dir = QFileDialog::getExistingDirectory(this, "Select Directory with CT Slice TIFFs", QString::fromStdString(currentDatasetPath_));
+    if (!dir.isEmpty()) {
+        loadVolumeFromDirectory(dir.toStdString());
+    }
+}
+
+void CTViewerWindow::onOpenSingleSliceTriggered() {
+    QString file = QFileDialog::getOpenFileName(this, "Select Single 2D CT Slice", QString::fromStdString(currentDatasetPath_), "TIFF Images (*.tif *.tiff)");
+    if (!file.isEmpty()) {
+        loadSingleSliceFile(file.toStdString());
+    }
+}
+
+void CTViewerWindow::onAboutTriggered() {
+    QMessageBox::about(this, "About CT Segmentation Viewer",
+        "<h3>Interactive CT Segmentation & Viewer</h3>"
+        "<p>Built with <b>ITK</b>, <b>VTK</b>, and <b>Qt6</b>.</p>"
+        "<p>Features:</p>"
+        "<ul>"
+        "<li>Synchronized 3-view orthogonal reslicing (Axial, Coronal, Sagittal)</li>"
+        "<li>Interactive crosshairs & voxel intensity probe</li>"
+        "<li>ITK Preprocessing: Gaussian, Median, Anisotropic Diffusion, Ring Correction</li>"
+        "<li>ITK Segmentation: Threshold, Otsu, Multi-Otsu, Region Growing, K-Means</li>"
+        "<li><b>High-contrast vector boundary contours</b> with independent fill opacity</li>"
+        "<li>Full TIFF export for filtered images, masks, and masked CT data</li>"
+        "</ul>");
+}
+
+void CTViewerWindow::updateStatusInfo() {
+    double val = 0.0;
+    if (displayVolume_) {
+        VolumeType::IndexType idx = {currentCursor_[0], currentCursor_[1], currentCursor_[2]};
+        if (displayVolume_->GetLargestPossibleRegion().IsInside(idx)) {
+            val = static_cast<double>(displayVolume_->GetPixel(idx));
+        }
+    }
+    statusVoxelLabel_->setText(
+        QString("Pos: (%1, %2, %3) | Val: %4 | Slice: Z=%5 Y=%6 X=%7")
+            .arg(currentCursor_[0]).arg(currentCursor_[1]).arg(currentCursor_[2])
+            .arg(val)
+            .arg(axialView_->currentSlice())
+            .arg(coronalView_->currentSlice())
+            .arg(sagittalView_->currentSlice())
+    );
+}
+
+// -------------------------------------------------------------------------
+// HEADLESS TESTING HOOKS
+// -------------------------------------------------------------------------
+
+void CTViewerWindow::runTestSeedAndGrow(int x, int y, int z) {
+    onVoxelClicked(x, y, z);
+    algorithmComboBox_->setCurrentIndex(3); // Region Growing
+    seedXSpin_->setValue(x);
+    seedYSpin_->setValue(y);
+    seedZSpin_->setValue(z);
+    regionGrowMultSpin_->setValue(2.5);
+    regionGrowIterSpin_->setValue(5);
+    onApplySegmentationClicked();
+    onShowBoundaryToggled(true);
+    onShowFillToggled(true);
+}
+
+bool CTViewerWindow::saveScreenshot(const std::string& pngPath) {
+    QApplication::processEvents();
+    axialView_->render();
+    coronalView_->render();
+    sagittalView_->render();
+    QApplication::processEvents();
+
+    QPixmap pixmap = grab();
+    return pixmap.save(QString::fromStdString(pngPath), "PNG");
+}
+
+} // namespace ctseg

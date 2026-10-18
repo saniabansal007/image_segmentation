@@ -1,4 +1,4 @@
-#pragma once //prevents the header files from being included multiple times in the same compilation
+#pragma once
 #include <itkImage.h>
 #include <string>
 #include <map>
@@ -8,13 +8,11 @@ namespace ctseg {
 // Standard pixel/image types used across the whole module.
 // 2D for now; a 3D counterpart (itk::Image<PixelType, 3>) is a direct
 // extension since ITK filters are dimension-templated, noted in README.
+using PixelType = unsigned short;              // raw 16-bit CT intensity
+using ImageType = itk::Image<PixelType, 2>;
 
-using PixelType= unsigned short;    // raw 16-bit CT intensity
-using ImageType= itk::Image<PixelType, 2>;
-
-//gives labels like 0 = background, 1 = tissue, 2 = bone
-using LabelPixelType= unsigned char;          // up to 255 segmentation classes
-using LabelImageType= itk::Image<LabelPixelType, 2>;
+using LabelPixelType = unsigned char;          // up to 255 segmentation classes
+using LabelImageType = itk::Image<LabelPixelType, 2>;
 
 // Generic parameter bag so each method can accept its own tunables
 // without changing the common interface.

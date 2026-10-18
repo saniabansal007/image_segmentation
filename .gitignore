@@ -1,101 +1,30 @@
-# ==========================================
-# C++ / CMake Build Outputs
-# ==========================================
+# Build directory (CMake outputs, object files, binaries, Qt autogen)
 build/
-bin/
-lib/
-cmake-build-*/
-CMakeCache.txt
-CMakeFiles/
-cmake_install.cmake
-Makefile
-compile_commands.json
-CTestTestfile.cmake
-Testing/
-ITKFactoryRegistration/
-.qt/
 
-# Compiled object files and libraries
+# Binaries & compiled objects (if built outside build/)
 *.o
 *.obj
-*.so
-*.dylib
-*.dll
-*.a
-*.lib
-
-# Executables and debug symbols
-ct_segmentation
-ct_segmentation.exe
 *.exe
-*.out
-*.app
-*.pdb
-*.ilk
-*.idb
+ct_segmentation
+ct_segmentation_3d
+ct_segmentation_gpu
+ct_viewer
+debug_canny
+test_roi_processor
+*_autogen/
+.qt/
 
-# ==========================================
-# Python Environments & Cache
-# ==========================================
+# Python virtual environment & cache
 venv/
-.venv/
-env/
-ENV/
 __pycache__/
-*.py[cod]
-*$py.class
-*.egg-info/
-dist/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
+*.pyc
 
-# ==========================================
-# Pipeline Outputs & Intermediate Images
-# ==========================================
+# Generated outputs & exports
+output*.png
 output_*.png
-*.cleaned.tif
-outputs/
-output/
-results/
-*.log
+*.roi.tif
+*.mask.tif
 
-# Large dataset files (uncomment if you want to exclude raw CT data from git)
-# data/*.tif
-# data/*.tiff
-
-# ==========================================
-# IDE & Editor Settings
-# ==========================================
-# VS Code (ignore user state, allow shared config)
-.vscode/*
-!.vscode/settings.json
-!.vscode/tasks.json
-!.vscode/launch.json
-!.vscode/extensions.json
-
-# JetBrains / CLion
-.idea/
-*.iml
-
-# Vim / Emacs backup files
-*.swp
-*.swo
-*~
-.#*
-
-# ==========================================
-# Operating System Files
-# ==========================================
-# macOS
-.DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-
-# Windows
+# Editor & OS
+.vscode/
 Thumbs.db
-ehthumbs.db
-[Dd]esktop.ini
-$RECYCLE.BIN/
