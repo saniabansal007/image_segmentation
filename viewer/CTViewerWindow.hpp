@@ -1,7 +1,7 @@
-#pragma once
-
 #include "../volume/VolumeTypes.hpp"
+#include "../volume/SliceStore.hpp"
 #include "OrthoSliceView.hpp"
+#include <memory>
 
 #include <QMainWindow>
 #include <QComboBox>
@@ -18,8 +18,15 @@
 #include <QLabel>
 #include <QProgressBar>
 #include <QStatusBar>
+#include <QThread>
+#include <QKeyEvent>
+#include <QCloseEvent>
+#include <QAction>
+#include <atomic>
 
 #include <itkImageToVTKImageFilter.h>
+#include <itkProcessObject.h>
+#include <itkCommand.h>
 
 namespace ctseg {
 
@@ -27,14 +34,26 @@ class CTViewerWindow : public QMainWindow {
     Q_OBJECT
 public:
     explicit CTViewerWindow(QWidget* parent = nullptr);
-    ~CTViewerWindow() override = default;
+    ~CTViewerWindow() override;
 
     bool loadVolumeFromDirectory(const std::string& dirPath, size_t maxSlices = 0);
     bool loadSingleSliceFile(const std::string& filePath);
+    bool loadPreprocessedDataset(const std::string& preprocessedDir);
+    bool isLazyLoadingMode() const { return isLazyLoadingMode_; }
+    bool ensureFullVolumeLoaded();
 
     // Headless testing hooks
     void runTestSeedAndGrow(int x, int y, int z);
     bool saveScreenshot(const std::string& pngPath);
+
+    // Process Control & Cancellation
+    void stopRunningProcess();
+    bool isProcessRunning() const { return isProcessRunning_.load(); }
+
+protected:
+    void keyPressEvent(QKeyEvent* event) override;
+    void closeEvent(QCloseEvent* event) override;
+    bool eventFilter(QObject* obj, QEvent* event) override;
 
 private slots:
     // Menu Actions
@@ -81,6 +100,10 @@ private slots:
     void onExportFilteredClicked();
     void onExportMaskClicked();
     void onExportMaskedCTClicked();
+
+    // Process Execution Completion Slots
+    void onFilterCompleted(VolumeType::Pointer outVol, const QString& filterName, bool aborted, const QString& errMsg, qint64 elapsedMs);
+    void onSegmentationCompleted(LabelVolumeType::Pointer outMask, const QString& segName, bool aborted, const QString& errMsg, long fgCount, qint64 elapsedMs);
 
 private:
     void setupUI();
@@ -190,6 +213,15 @@ private:
     QLabel* statusSegLabel_ = nullptr;
     QLabel* statusPerfLabel_ = nullptr;
     QProgressBar* progressBar_ = nullptr;
+    QPushButton* stopProcessBtn_ = nullptr;
+    QAction* stopProcessAct_ = nullptr;
+
+    // Running process management
+    void resetProcessUI();
+    std::atomic<bool> isProcessRunning_{false};
+    std::atomic<bool> cancelRequested_{false};
+    itk::ProcessObject::Pointer currentProcessObject_{nullptr};
+    QThread* activeWorkerThread_ = nullptr;
 
     // Active state
     int currentCursor_[3] = {0, 0, 0};
@@ -198,6 +230,13 @@ private:
     double autoLevel_ = 500.0;
     double minVoxelVal_ = 0.0;
     double maxVoxelVal_ = 65535.0;
+
+    // Lazy slice loading
+    std::shared_ptr<SliceStore> sliceStore_;
+    std::string preprocessedDir_;
+    bool isLazyLoadingMode_ = false;
+    uint64_t sliceRequestSeq_ = 0;
+    void requestSlicesForCursor(int x, int y, int z);
 };
 
 } // namespace ctseg

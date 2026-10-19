@@ -118,7 +118,12 @@ public:
                            "'); tifffile.imwrite('" + cleaned + "', a)\"";
         int rc = std::system(cmd.c_str());
         if (rc != 0) {
-            throw std::runtime_error("Failed to sanitize TIFF metadata for: " + path);
+            std::string cmd2 = "python -c \"import tifffile; a = tifffile.imread('" + path +
+                               "'); tifffile.imwrite('" + cleaned + "', a)\"";
+            rc = std::system(cmd2.c_str());
+        }
+        if (rc != 0) {
+            return path; // Fall back to original path if python sanitization is unavailable
         }
         return cleaned;
     }

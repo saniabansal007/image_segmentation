@@ -56,6 +56,95 @@ CTViewerWindow::CTViewerWindow(QWidget* parent) : QMainWindow(parent) {
     setupUI();
     setupMenuBar();
     setupStatusBar();
+
+    qApp->installEventFilter(this);
+}
+
+CTViewerWindow::~CTViewerWindow() {
+    if (isProcessRunning_.load()) {
+        stopRunningProcess();
+        if (activeWorkerThread_ && activeWorkerThread_->isRunning()) {
+            activeWorkerThread_->wait(3000);
+        }
+    }
+}
+
+void CTViewerWindow::stopRunningProcess() {
+    if (!isProcessRunning_.load()) return;
+
+    cancelRequested_.store(true);
+    statusPerfLabel_->setText("Stopping running process... please wait");
+    if (stopProcessBtn_) {
+        stopProcessBtn_->setText("Stopping...");
+        stopProcessBtn_->setEnabled(false);
+    }
+    if (currentProcessObject_) {
+        try {
+            currentProcessObject_->SetAbortGenerateData(true);
+        } catch (...) {}
+    }
+    QApplication::processEvents();
+}
+
+void CTViewerWindow::resetProcessUI() {
+    isProcessRunning_.store(false);
+    cancelRequested_.store(false);
+    currentProcessObject_ = nullptr;
+    activeWorkerThread_ = nullptr;
+
+    if (applyFilterBtn_) {
+        applyFilterBtn_->setText("Apply Filter");
+        applyFilterBtn_->setStyleSheet("background-color: #059669; font-weight: bold;");
+        applyFilterBtn_->setEnabled(true);
+    }
+    if (applySegBtn_) {
+        applySegBtn_->setText("Apply Segmentation");
+        applySegBtn_->setStyleSheet("background-color: #D97706; font-weight: bold;");
+        applySegBtn_->setEnabled(true);
+    }
+    if (stopProcessBtn_) {
+        stopProcessBtn_->setText("■ Stop");
+        stopProcessBtn_->setEnabled(true);
+        stopProcessBtn_->setVisible(false);
+    }
+    if (stopProcessAct_) {
+        stopProcessAct_->setEnabled(false);
+    }
+    if (progressBar_) {
+        progressBar_->setVisible(false);
+        progressBar_->setValue(0);
+    }
+    QApplication::restoreOverrideCursor();
+}
+
+void CTViewerWindow::keyPressEvent(QKeyEvent* event) {
+    if (event->key() == Qt::Key_Escape && isProcessRunning_.load()) {
+        stopRunningProcess();
+        event->accept();
+        return;
+    }
+    QMainWindow::keyPressEvent(event);
+}
+
+void CTViewerWindow::closeEvent(QCloseEvent* event) {
+    if (isProcessRunning_.load()) {
+        stopRunningProcess();
+        if (activeWorkerThread_ && activeWorkerThread_->isRunning()) {
+            activeWorkerThread_->wait(2000);
+        }
+    }
+    event->accept();
+}
+
+bool CTViewerWindow::eventFilter(QObject* obj, QEvent* event) {
+    if (event->type() == QEvent::KeyPress) {
+        auto* keyEvent = static_cast<QKeyEvent*>(event);
+        if (keyEvent->key() == Qt::Key_Escape && isProcessRunning_.load()) {
+            stopRunningProcess();
+            return true;
+        }
+    }
+    return QMainWindow::eventFilter(obj, event);
 }
 
 void CTViewerWindow::applyDarkTheme() {
@@ -121,6 +210,12 @@ void CTViewerWindow::setupMenuBar() {
     viewMenu->addSeparator();
     auto* resetCamAct = viewMenu->addAction("Reset Cameras / Fit to Window");
     connect(resetCamAct, &QAction::triggered, this, &CTViewerWindow::onResetCamerasClicked);
+
+    auto* processMenu = menuBar()->addMenu("&Process");
+    stopProcessAct_ = processMenu->addAction("&Stop Running Process");
+    stopProcessAct_->setShortcut(QKeySequence(Qt::Key_Escape));
+    stopProcessAct_->setEnabled(false);
+    connect(stopProcessAct_, &QAction::triggered, this, &CTViewerWindow::stopRunningProcess);
 
     auto* helpMenu = menuBar()->addMenu("&Help");
     auto* aboutAct = helpMenu->addAction("&About CT Segmentation Viewer");
@@ -673,11 +768,23 @@ void CTViewerWindow::setupStatusBar() {
     bar->addWidget(statusPerfLabel_, 1);
 
     progressBar_ = new QProgressBar(this);
-    progressBar_->setMaximumWidth(140);
+    progressBar_->setMaximumWidth(130);
     progressBar_->setMaximumHeight(14);
-    progressBar_->setRange(0, 0); // indeterminate
+    progressBar_->setRange(0, 100);
+    progressBar_->setValue(0);
     progressBar_->setVisible(false);
     bar->addPermanentWidget(progressBar_);
+
+    stopProcessBtn_ = new QPushButton("■ Stop", this);
+    stopProcessBtn_->setToolTip("Stop the running process (or press Esc)");
+    stopProcessBtn_->setStyleSheet(
+        "QPushButton { background-color: #DC2626; color: #FFFFFF; font-weight: bold; border-radius: 3px; padding: 2px 10px; font-size: 11px; margin-left: 4px; } "
+        "QPushButton:hover { background-color: #B91C1C; } "
+        "QPushButton:disabled { background-color: #7F1D1D; color: #9CA3AF; }"
+    );
+    stopProcessBtn_->setVisible(false);
+    connect(stopProcessBtn_, &QPushButton::clicked, this, &CTViewerWindow::stopRunningProcess);
+    bar->addPermanentWidget(stopProcessBtn_);
 }
 
 // -------------------------------------------------------------------------
@@ -685,6 +792,25 @@ void CTViewerWindow::setupStatusBar() {
 // -------------------------------------------------------------------------
 
 bool CTViewerWindow::loadVolumeFromDirectory(const std::string& dirPath, size_t maxSlices) {
+    // If not requesting a partial debug slice count, auto-detect preprocessed data first
+    if (maxSlices == 0) {
+        std::string prepDir;
+        if (SliceStore::isPreprocessed(dirPath)) {
+            prepDir = dirPath;
+        } else if (SliceStore::isPreprocessed(dirPath + "_preprocessed")) {
+            prepDir = dirPath + "_preprocessed";
+        } else if (SliceStore::isPreprocessed(dirPath + "/data_preprocessed")) {
+            prepDir = dirPath + "/data_preprocessed";
+        } else if ((dirPath == "data" || dirPath == "./data") && SliceStore::isPreprocessed("data_preprocessed")) {
+            prepDir = "data_preprocessed";
+        }
+
+        if (!prepDir.empty()) {
+            currentDatasetPath_ = dirPath;
+            return loadPreprocessedDataset(prepDir);
+        }
+    }
+
     statusPerfLabel_->setText("Loading CT volume from: " + QString::fromStdString(dirPath) + " ...");
     progressBar_->setVisible(true);
     QApplication::setOverrideCursor(Qt::WaitCursor);
@@ -694,6 +820,12 @@ bool CTViewerWindow::loadVolumeFromDirectory(const std::string& dirPath, size_t 
         QElapsedTimer timer; timer.start();
         VolumeType::Pointer vol = VolumeIO::loadVolumeFromDirectory(dirPath, ".tif", maxSlices);
         originalVolume_ = vol;
+        filteredVolume_ = nullptr;
+        displayVolume_ = originalVolume_;
+        segmentationMask_ = nullptr;
+        currentDatasetPath_ = dirPath;
+        isSingleSlice_ = false;
+        isLazyLoadingMode_ = false;
         filteredVolume_ = nullptr;
         displayVolume_ = originalVolume_;
         segmentationMask_ = nullptr;
@@ -756,6 +888,210 @@ bool CTViewerWindow::loadVolumeFromDirectory(const std::string& dirPath, size_t 
         QApplication::restoreOverrideCursor();
         QMessageBox::critical(this, "Load Error", QString("Failed to load CT volume:\n%1").arg(e.what()));
         statusPerfLabel_->setText("Load failed");
+        return false;
+    }
+}
+
+bool CTViewerWindow::loadPreprocessedDataset(const std::string& preprocessedDir) {
+    statusPerfLabel_->setText("Opening preprocessed CT dataset: " + QString::fromStdString(preprocessedDir) + " ...");
+    progressBar_->setVisible(true);
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    QApplication::processEvents();
+
+    try {
+        QElapsedTimer timer; timer.start();
+        auto store = std::make_shared<SliceStore>(128 * 1024 * 1024); // 128 MB LRU cache
+        if (!store->open(preprocessedDir)) {
+            throw std::runtime_error("Failed to open preprocessed directory: " + preprocessedDir);
+        }
+
+        sliceStore_ = store;
+        preprocessedDir_ = preprocessedDir;
+        currentDatasetPath_ = preprocessedDir;
+        isLazyLoadingMode_ = true;
+        originalVolume_ = nullptr;
+        filteredVolume_ = nullptr;
+        displayVolume_ = nullptr;
+        segmentationMask_ = nullptr;
+        isSingleSlice_ = false;
+
+        const auto& manifest = sliceStore_->manifest();
+        minVoxelVal_ = manifest.minIntensity;
+        maxVoxelVal_ = manifest.maxIntensity;
+        autoWindow_ = manifest.autoWindow;
+        autoLevel_ = manifest.autoLevel;
+
+        windowSlider_->setRange(1, static_cast<int>(maxVoxelVal_ - minVoxelVal_ + 10));
+        windowSpinBox_->setRange(1, static_cast<int>(maxVoxelVal_ - minVoxelVal_ + 10));
+        levelSlider_->setRange(static_cast<int>(minVoxelVal_), static_cast<int>(maxVoxelVal_));
+        levelSpinBox_->setRange(static_cast<int>(minVoxelVal_ - 1000), static_cast<int>(maxVoxelVal_ + 1000));
+
+        windowSlider_->setValue(static_cast<int>(autoWindow_));
+        levelSlider_->setValue(static_cast<int>(autoLevel_));
+        windowSpinBox_->setValue(static_cast<int>(autoWindow_));
+        levelSpinBox_->setValue(static_cast<int>(autoLevel_));
+
+        datasetInfoLabel_->setText(
+            QString("Dataset: %1 (Lazy Multi-Plane Store)\nDimensions: %2 x %3 x %4 voxels\nVoxel Spacing: [%5, %6, %7] mm\nIntensity Range: [%8, %9]\nBounded Cache: %10 MB")
+                .arg(QDir(QString::fromStdString(preprocessedDir)).dirName())
+                .arg(manifest.dimX).arg(manifest.dimY).arg(manifest.dimZ)
+                .arg(manifest.spacingX, 0, 'f', 2).arg(manifest.spacingY, 0, 'f', 2).arg(manifest.spacingZ, 0, 'f', 2)
+                .arg(minVoxelVal_).arg(maxVoxelVal_)
+                .arg(store->cache().maxBytes() / (1024 * 1024))
+        );
+
+        seedXSpin_->setRange(0, manifest.dimX - 1);
+        seedYSpin_->setRange(0, manifest.dimY - 1);
+        seedZSpin_->setRange(0, manifest.dimZ - 1);
+        seedXSpin_->setValue(manifest.dimX / 2);
+        seedYSpin_->setValue(manifest.dimY / 2);
+        seedZSpin_->setValue(manifest.dimZ / 2);
+
+        threshLowerSpin_->setRange(static_cast<int>(minVoxelVal_), static_cast<int>(maxVoxelVal_));
+        threshUpperSpin_->setRange(static_cast<int>(minVoxelVal_), static_cast<int>(maxVoxelVal_));
+        threshLowerSpin_->setValue(static_cast<int>(autoLevel_));
+        threshUpperSpin_->setValue(static_cast<int>(maxVoxelVal_));
+
+        // Initialize geometry on each OrthoSliceView
+        double sp[3] = {manifest.spacingX, manifest.spacingY, manifest.spacingZ};
+        double orig[3] = {manifest.originX, manifest.originY, manifest.originZ};
+
+        axialView_->initGeometry(manifest.dimX, manifest.dimY, manifest.dimZ, sp, orig);
+        coronalView_->initGeometry(manifest.dimX, manifest.dimY, manifest.dimZ, sp, orig);
+        sagittalView_->initGeometry(manifest.dimX, manifest.dimY, manifest.dimZ, sp, orig);
+
+        axialView_->setWindowLevel(autoWindow_, autoLevel_);
+        coronalView_->setWindowLevel(autoWindow_, autoLevel_);
+        sagittalView_->setWindowLevel(autoWindow_, autoLevel_);
+
+        // Set cursor to center and request initial slices
+        int cx = manifest.dimX / 2;
+        int cy = manifest.dimY / 2;
+        int cz = manifest.dimZ / 2;
+        currentCursor_[0] = cx;
+        currentCursor_[1] = cy;
+        currentCursor_[2] = cz;
+
+        requestSlicesForCursor(cx, cy, cz);
+
+        statusPerfLabel_->setText(QString("Preprocessed dataset ready in %1 ms (Lazy loading active)").arg(timer.elapsed()));
+        progressBar_->setVisible(false);
+        QApplication::restoreOverrideCursor();
+        return true;
+    } catch (const std::exception& e) {
+        progressBar_->setVisible(false);
+        QApplication::restoreOverrideCursor();
+        QMessageBox::critical(this, "Load Error", QString("Failed to load preprocessed dataset:\n%1").arg(e.what()));
+        statusPerfLabel_->setText("Preprocessed load failed");
+        return false;
+    }
+}
+
+void CTViewerWindow::requestSlicesForCursor(int x, int y, int z) {
+    if (!sliceStore_ || !isLazyLoadingMode_) return;
+
+    uint64_t seq = ++sliceRequestSeq_;
+
+    // Axial slice: plane Z = z (orientation 2)
+    auto axSlice = sliceStore_->getSlice(2, z);
+    if (axSlice && seq == sliceRequestSeq_) {
+        axialView_->setSliceData2D(axSlice->data(), sliceStore_->manifest().dimX, sliceStore_->manifest().dimY, z);
+    }
+
+    // Coronal slice: plane Y = y (orientation 1)
+    auto corSlice = sliceStore_->getSlice(1, y);
+    if (corSlice && seq == sliceRequestSeq_) {
+        coronalView_->setSliceData2D(corSlice->data(), sliceStore_->manifest().dimX, sliceStore_->manifest().dimZ, y);
+    }
+
+    // Sagittal slice: plane X = x (orientation 0)
+    auto sagSlice = sliceStore_->getSlice(0, x);
+    if (sagSlice && seq == sliceRequestSeq_) {
+        sagittalView_->setSliceData2D(sagSlice->data(), sliceStore_->manifest().dimY, sliceStore_->manifest().dimZ, x);
+    }
+
+    axialView_->setCrosshairPosition(x, y, z);
+    coronalView_->setCrosshairPosition(x, y, z);
+    sagittalView_->setCrosshairPosition(x, y, z);
+}
+
+bool CTViewerWindow::ensureFullVolumeLoaded() {
+    if (originalVolume_) return true;
+
+    // 1. If in lazy loading mode with an open SliceStore, construct the 3D volume
+    // directly and quickly (<1s) from the disk-backed preprocessed raw slices.
+    if (isLazyLoadingMode_ && sliceStore_ && sliceStore_->isOpen()) {
+        statusPerfLabel_->setText("Loading full 3D volume from preprocessed slices...");
+        progressBar_->setVisible(true);
+        progressBar_->setRange(0, 100);
+        progressBar_->setValue(0);
+        QApplication::setOverrideCursor(Qt::WaitCursor);
+        QApplication::processEvents();
+
+        try {
+            QElapsedTimer timer; timer.start();
+            originalVolume_ = sliceStore_->loadFullVolume([this](int pct, const std::string& msg) {
+                QMetaObject::invokeMethod(this, [this, pct, msg]() {
+                    progressBar_->setValue(pct);
+                    statusPerfLabel_->setText(QString::fromStdString(msg));
+                }, Qt::QueuedConnection);
+            });
+
+            if (!originalVolume_) {
+                throw std::runtime_error("Failed to construct 3D volume from preprocessed slices.");
+            }
+
+            displayVolume_ = originalVolume_;
+            currentDatasetPath_ = preprocessedDir_;
+            statusPerfLabel_->setText(QString("Full 3D volume loaded (%1 ms) - ready for 3D processing").arg(timer.elapsed()));
+            progressBar_->setVisible(false);
+            QApplication::restoreOverrideCursor();
+            return true;
+        } catch (const std::exception& e) {
+            progressBar_->setVisible(false);
+            QApplication::restoreOverrideCursor();
+            QMessageBox::critical(this, "3D Volume Load Error", QString("Could not load volume from preprocessed store:\n%1").arg(e.what()));
+            return false;
+        }
+    }
+
+    if (!isLazyLoadingMode_) return false;
+
+    // 2. Fallback: if not using preprocessed store, try source directory
+    std::string sourceDir = currentDatasetPath_;
+    if (sourceDir.empty() || !std::filesystem::exists(sourceDir) || !std::filesystem::is_directory(sourceDir)) {
+        if (sliceStore_ && !sliceStore_->manifest().sourceDirectory.empty() && std::filesystem::exists(sliceStore_->manifest().sourceDirectory)) {
+            sourceDir = sliceStore_->manifest().sourceDirectory;
+        } else if (std::filesystem::exists("data")) {
+            sourceDir = "data";
+        } else {
+            QString selected = QFileDialog::getExistingDirectory(
+                this, "Select Original TIFF Volume Directory for 3D Processing", QString::fromStdString(preprocessedDir_));
+            if (selected.isEmpty()) return false;
+            sourceDir = selected.toStdString();
+        }
+    }
+
+    statusPerfLabel_->setText("Loading full 3D volume for algorithm execution...");
+    progressBar_->setVisible(true);
+    progressBar_->setRange(0, 100);
+    progressBar_->setValue(0);
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    QApplication::processEvents();
+
+    try {
+        QElapsedTimer timer; timer.start();
+        originalVolume_ = VolumeIO::loadVolumeFromDirectory(sourceDir, ".tif", 0);
+        displayVolume_ = originalVolume_;
+        currentDatasetPath_ = sourceDir;
+        statusPerfLabel_->setText(QString("Full 3D volume loaded (%1 ms) - proceeding with 3D algorithm").arg(timer.elapsed()));
+        progressBar_->setVisible(false);
+        QApplication::restoreOverrideCursor();
+        return true;
+    } catch (const std::exception& e) {
+        progressBar_->setVisible(false);
+        QApplication::restoreOverrideCursor();
+        QMessageBox::critical(this, "3D Volume Load Error", QString("Could not load original volume:\n%1").arg(e.what()));
         return false;
     }
 }
@@ -922,6 +1258,26 @@ void CTViewerWindow::onSliceChanged(int orientation, int sliceIndex) {
     else if (orientation == 1) currentCursor_[1] = sliceIndex;
     else if (orientation == 0) currentCursor_[0] = sliceIndex;
 
+    if (isLazyLoadingMode_ && sliceStore_) {
+        uint64_t seq = ++sliceRequestSeq_;
+        if (orientation == 2) {
+            auto s = sliceStore_->getSlice(2, sliceIndex);
+            if (s && seq == sliceRequestSeq_) {
+                axialView_->setSliceData2D(s->data(), sliceStore_->manifest().dimX, sliceStore_->manifest().dimY, sliceIndex);
+            }
+        } else if (orientation == 1) {
+            auto s = sliceStore_->getSlice(1, sliceIndex);
+            if (s && seq == sliceRequestSeq_) {
+                coronalView_->setSliceData2D(s->data(), sliceStore_->manifest().dimX, sliceStore_->manifest().dimZ, sliceIndex);
+            }
+        } else if (orientation == 0) {
+            auto s = sliceStore_->getSlice(0, sliceIndex);
+            if (s && seq == sliceRequestSeq_) {
+                sagittalView_->setSliceData2D(s->data(), sliceStore_->manifest().dimY, sliceStore_->manifest().dimZ, sliceIndex);
+            }
+        }
+    }
+
     axialView_->setCrosshairPosition(currentCursor_[0], currentCursor_[1], currentCursor_[2]);
     coronalView_->setCrosshairPosition(currentCursor_[0], currentCursor_[1], currentCursor_[2]);
     sagittalView_->setCrosshairPosition(currentCursor_[0], currentCursor_[1], currentCursor_[2]);
@@ -934,14 +1290,17 @@ void CTViewerWindow::onVoxelClicked(int x, int y, int z) {
     currentCursor_[1] = y;
     currentCursor_[2] = z;
 
-    // Jump all 3 views to the clicked 3D slice coordinates
-    axialView_->setSlice(z);
-    coronalView_->setSlice(y);
-    sagittalView_->setSlice(x);
+    if (isLazyLoadingMode_ && sliceStore_) {
+        requestSlicesForCursor(x, y, z);
+    } else {
+        axialView_->setSlice(z);
+        coronalView_->setSlice(y);
+        sagittalView_->setSlice(x);
 
-    axialView_->setCrosshairPosition(x, y, z);
-    coronalView_->setCrosshairPosition(x, y, z);
-    sagittalView_->setCrosshairPosition(x, y, z);
+        axialView_->setCrosshairPosition(x, y, z);
+        coronalView_->setCrosshairPosition(x, y, z);
+        sagittalView_->setCrosshairPosition(x, y, z);
+    }
 
     // Synchronize Region Growing seed spinboxes
     seedXSpin_->blockSignals(true); seedXSpin_->setValue(x); seedXSpin_->blockSignals(false);
@@ -952,6 +1311,9 @@ void CTViewerWindow::onVoxelClicked(int x, int y, int z) {
 }
 
 void CTViewerWindow::onVoxelHovered(int x, int y, int z, double intensity) {
+    if (isLazyLoadingMode_ && sliceStore_) {
+        intensity = sliceStore_->getVoxelValue(x, y, z);
+    }
     statusVoxelLabel_->setText(QString("Voxel: (%1, %2, %3) | Val: %4").arg(x).arg(y).arg(z).arg(intensity));
 }
 
@@ -1067,9 +1429,18 @@ void CTViewerWindow::onFilterSelectionChanged(int index) {
 }
 
 void CTViewerWindow::onApplyFilterClicked() {
-    if (!originalVolume_) {
-        QMessageBox::warning(this, "Warning", "Please load a dataset first.");
+    if (isProcessRunning_.load()) {
+        stopRunningProcess();
         return;
+    }
+
+    if (!originalVolume_) {
+        if (isLazyLoadingMode_) {
+            if (!ensureFullVolumeLoaded()) return;
+        } else {
+            QMessageBox::warning(this, "Warning", "Please load a dataset first.");
+            return;
+        }
     }
 
     int filterIdx = filterComboBox_->currentIndex();
@@ -1078,107 +1449,202 @@ void CTViewerWindow::onApplyFilterClicked() {
         return;
     }
 
+    isProcessRunning_.store(true);
+    cancelRequested_.store(false);
+
+    applyFilterBtn_->setText("■ Stop Filter");
+    applyFilterBtn_->setStyleSheet("background-color: #DC2626; font-weight: bold;");
+    applySegBtn_->setEnabled(false);
+
+    stopProcessBtn_->setVisible(true);
+    stopProcessBtn_->setEnabled(true);
+    stopProcessBtn_->setText("■ Stop");
     progressBar_->setVisible(true);
+    progressBar_->setRange(0, 100);
+    progressBar_->setValue(0);
+    if (stopProcessAct_) stopProcessAct_->setEnabled(true);
+
     QApplication::setOverrideCursor(Qt::WaitCursor);
-    statusPerfLabel_->setText("Applying filter...");
-    QApplication::processEvents();
+    statusPerfLabel_->setText("Applying filter... (Press Esc or click Stop to cancel)");
 
-    QElapsedTimer timer; timer.start();
+    // Capture parameters for worker thread
+    double sigma = gaussianSigmaSpin_->value();
+    unsigned int medianRadius = static_cast<unsigned int>(medianRadiusSpin_->value());
+    unsigned int anisoIters = static_cast<unsigned int>(anisoIterSpin_->value());
+    double anisoCond = anisoConductanceSpin_->value();
+    double anisoTimeStep = anisoTimeStepSpin_->value();
+    VolumeType::Pointer inputVol = originalVolume_;
 
-    try {
-        if (filterIdx == 1) { // Gaussian Smoothing
-            double sigma = gaussianSigmaSpin_->value();
-            using GaussType = itk::DiscreteGaussianImageFilter<VolumeType, VolumeType>;
-            auto filter = GaussType::New();
-            filter->SetInput(originalVolume_);
-            filter->SetVariance(sigma * sigma);
-            filter->Update();
-            filteredVolume_ = filter->GetOutput();
-            statusFilterLabel_->setText(QString("Filter: Gaussian (σ=%1)").arg(sigma));
-        } else if (filterIdx == 2) { // Median Filtering
-            unsigned int radius = static_cast<unsigned int>(medianRadiusSpin_->value());
-            using MedianType = itk::MedianImageFilter<VolumeType, VolumeType>;
-            auto filter = MedianType::New();
-            filter->SetInput(originalVolume_);
-            VolumeType::SizeType r; r.Fill(radius);
-            filter->SetRadius(r);
-            filter->Update();
-            filteredVolume_ = filter->GetOutput();
-            statusFilterLabel_->setText(QString("Filter: Median (r=%1)").arg(radius));
-        } else if (filterIdx == 3) { // Anisotropic Diffusion
-            unsigned int iters = static_cast<unsigned int>(anisoIterSpin_->value());
-            double cond = anisoConductanceSpin_->value();
-            double timeStep = anisoTimeStepSpin_->value();
+    activeWorkerThread_ = QThread::create([this, filterIdx, sigma, medianRadius, anisoIters, anisoCond, anisoTimeStep, inputVol]() {
+        VolumeType::Pointer outVol = nullptr;
+        QString filterName;
+        bool aborted = false;
+        QString errMsg;
+        QElapsedTimer timer; timer.start();
 
-            // ITK's GradientAnisotropicDiffusionImageFilter requires float pixel type.
-            // Cast unsigned short volume to float, filter, then cast back.
-            using FloatVolumeType = itk::Image<float, 3>;
-            using CastToFloatType = itk::CastImageFilter<VolumeType, FloatVolumeType>;
-            auto toFloat = CastToFloatType::New();
-            toFloat->SetInput(originalVolume_);
+        auto makeObserver = [this]() {
+            auto observer = itk::CStyleCommand::New();
+            observer->SetClientData(this);
+            observer->SetCallback([](itk::Object* caller, const itk::EventObject&, void* clientData) {
+                auto* self = static_cast<CTViewerWindow*>(clientData);
+                if (self->cancelRequested_.load()) {
+                    if (auto* po = dynamic_cast<itk::ProcessObject*>(caller)) {
+                        po->SetAbortGenerateData(true);
+                    }
+                } else if (auto* po = dynamic_cast<itk::ProcessObject*>(caller)) {
+                    int pct = static_cast<int>(po->GetProgress() * 100);
+                    QMetaObject::invokeMethod(self, [self, pct]() {
+                        if (self->isProcessRunning_.load()) {
+                            self->progressBar_->setValue(pct);
+                        }
+                    }, Qt::QueuedConnection);
+                }
+            });
+            return observer;
+        };
 
-            using AnisoType = itk::GradientAnisotropicDiffusionImageFilter<FloatVolumeType, FloatVolumeType>;
-            auto filter = AnisoType::New();
-            filter->SetInput(toFloat->GetOutput());
-            filter->SetNumberOfIterations(iters);
-            filter->SetConductanceParameter(cond);
-            filter->SetTimeStep(timeStep);
+        try {
+            if (filterIdx == 1) { // Gaussian Smoothing
+                filterName = QString("Gaussian (σ=%1)").arg(sigma);
+                using GaussType = itk::DiscreteGaussianImageFilter<VolumeType, VolumeType>;
+                auto filter = GaussType::New();
+                filter->SetInput(inputVol);
+                filter->SetVariance(sigma * sigma);
+                currentProcessObject_ = filter;
+                filter->AddObserver(itk::ProgressEvent(), makeObserver());
+                filter->Update();
+                if (cancelRequested_.load()) aborted = true;
+                else outVol = filter->GetOutput();
 
-            using CastBackType = itk::CastImageFilter<FloatVolumeType, VolumeType>;
-            auto toShort = CastBackType::New();
-            toShort->SetInput(filter->GetOutput());
-            toShort->Update();
-            filteredVolume_ = toShort->GetOutput();
-            filteredVolume_->DisconnectPipeline();
-            statusFilterLabel_->setText(QString("Filter: Anisotropic (iter=%1, c=%2)").arg(iters).arg(cond));
-        } else if (filterIdx == 4) { // Ring Artifact Correction
-            // Apply 2D ring correction slice-by-slice across all axial slices
-            auto size = originalVolume_->GetLargestPossibleRegion().GetSize();
-            filteredVolume_ = VolumeType::New();
-            filteredVolume_->SetRegions(originalVolume_->GetLargestPossibleRegion());
-            filteredVolume_->SetSpacing(originalVolume_->GetSpacing());
-            filteredVolume_->SetOrigin(originalVolume_->GetOrigin());
-            filteredVolume_->Allocate();
+            } else if (filterIdx == 2) { // Median Filtering
+                filterName = QString("Median (r=%1)").arg(medianRadius);
+                using MedianType = itk::MedianImageFilter<VolumeType, VolumeType>;
+                auto filter = MedianType::New();
+                filter->SetInput(inputVol);
+                VolumeType::SizeType r; r.Fill(medianRadius);
+                filter->SetRadius(r);
+                currentProcessObject_ = filter;
+                filter->AddObserver(itk::ProgressEvent(), makeObserver());
+                filter->Update();
+                if (cancelRequested_.load()) aborted = true;
+                else outVol = filter->GetOutput();
 
-            unsigned int numZ = static_cast<unsigned int>(size[2]);
-            for (unsigned int z = 0; z < numZ; ++z) {
-                VolumeType::RegionType sliceReg = originalVolume_->GetLargestPossibleRegion();
-                sliceReg.SetSize(2, 0);
-                VolumeType::IndexType start = sliceReg.GetIndex();
-                start[2] = z;
-                sliceReg.SetIndex(start);
+            } else if (filterIdx == 3) { // Anisotropic Diffusion
+                filterName = QString("Anisotropic (iter=%1, c=%2)").arg(anisoIters).arg(anisoCond);
+                using FloatVolumeType = itk::Image<float, 3>;
+                using CastToFloatType = itk::CastImageFilter<VolumeType, FloatVolumeType>;
+                auto toFloat = CastToFloatType::New();
+                toFloat->SetInput(inputVol);
 
-                using ExtType = itk::ExtractImageFilter<VolumeType, ImageType>;
-                auto ext = ExtType::New();
-                ext->SetExtractionRegion(sliceReg);
-                ext->SetInput(originalVolume_);
-                ext->SetDirectionCollapseToIdentity();
-                ext->Update();
+                using AnisoType = itk::GradientAnisotropicDiffusionImageFilter<FloatVolumeType, FloatVolumeType>;
+                auto filter = AnisoType::New();
+                filter->SetInput(toFloat->GetOutput());
+                filter->SetNumberOfIterations(anisoIters);
+                filter->SetConductanceParameter(anisoCond);
+                filter->SetTimeStep(anisoTimeStep);
+                currentProcessObject_ = filter;
+                filter->AddObserver(itk::ProgressEvent(), makeObserver());
 
-                ImageType::Pointer corrected = Preprocessing::suppressRingArtifacts(ext->GetOutput());
+                using CastBackType = itk::CastImageFilter<FloatVolumeType, VolumeType>;
+                auto toShort = CastBackType::New();
+                toShort->SetInput(filter->GetOutput());
+                toShort->Update();
 
-                itk::ImageRegionConstIterator<ImageType> cIt(corrected, corrected->GetLargestPossibleRegion());
-                sliceReg.SetSize(2, 1);
-                itk::ImageRegionIterator<VolumeType> outIt(filteredVolume_, sliceReg);
-                for (cIt.GoToBegin(), outIt.GoToBegin(); !cIt.IsAtEnd(); ++cIt, ++outIt) {
-                    outIt.Set(cIt.Get());
+                if (cancelRequested_.load()) aborted = true;
+                else {
+                    outVol = toShort->GetOutput();
+                    outVol->DisconnectPipeline();
+                }
+
+            } else if (filterIdx == 4) { // Ring Artifact Correction
+                filterName = "Ring Artifact Corrected";
+                auto size = inputVol->GetLargestPossibleRegion().GetSize();
+                outVol = VolumeType::New();
+                outVol->SetRegions(inputVol->GetLargestPossibleRegion());
+                outVol->SetSpacing(inputVol->GetSpacing());
+                outVol->SetOrigin(inputVol->GetOrigin());
+                outVol->Allocate();
+
+                unsigned int numZ = static_cast<unsigned int>(size[2]);
+                for (unsigned int z = 0; z < numZ; ++z) {
+                    if (cancelRequested_.load()) {
+                        aborted = true;
+                        break;
+                    }
+
+                    VolumeType::RegionType sliceReg = inputVol->GetLargestPossibleRegion();
+                    sliceReg.SetSize(2, 0);
+                    VolumeType::IndexType start = sliceReg.GetIndex();
+                    start[2] = z;
+                    sliceReg.SetIndex(start);
+
+                    using ExtType = itk::ExtractImageFilter<VolumeType, ImageType>;
+                    auto ext = ExtType::New();
+                    ext->SetExtractionRegion(sliceReg);
+                    ext->SetInput(inputVol);
+                    ext->SetDirectionCollapseToIdentity();
+                    ext->Update();
+
+                    ImageType::Pointer corrected = Preprocessing::suppressRingArtifacts(ext->GetOutput());
+
+                    itk::ImageRegionConstIterator<ImageType> cIt(corrected, corrected->GetLargestPossibleRegion());
+                    sliceReg.SetSize(2, 1);
+                    itk::ImageRegionIterator<VolumeType> outIt(outVol, sliceReg);
+                    for (cIt.GoToBegin(), outIt.GoToBegin(); !cIt.IsAtEnd(); ++cIt, ++outIt) {
+                        outIt.Set(cIt.Get());
+                    }
+
+                    int pct = static_cast<int>((z + 1) * 100 / numZ);
+                    QMetaObject::invokeMethod(this, [this, pct]() {
+                        if (isProcessRunning_.load()) {
+                            progressBar_->setValue(pct);
+                        }
+                    }, Qt::QueuedConnection);
                 }
             }
-            statusFilterLabel_->setText("Filter: Ring Artifact Corrected");
+        } catch (const itk::ProcessAborted&) {
+            aborted = true;
+        } catch (const std::exception& e) {
+            if (cancelRequested_.load()) {
+                aborted = true;
+            } else {
+                errMsg = QString::fromUtf8(e.what());
+            }
         }
 
-        displayVolume_ = filteredVolume_;
-        compareFilterCheck_->setChecked(false);
-        updateVolumeDisplay();
+        if (cancelRequested_.load()) aborted = true;
 
-        statusPerfLabel_->setText(QString("Filter applied successfully in %1 ms").arg(timer.elapsed()));
-    } catch (const std::exception& e) {
-        QMessageBox::critical(this, "Filter Error", QString("Filter processing failed:\n%1").arg(e.what()));
-        statusPerfLabel_->setText("Filter error");
+        QMetaObject::invokeMethod(this, [this, outVol, filterName, aborted, errMsg, elapsed = timer.elapsed()]() {
+            onFilterCompleted(outVol, filterName, aborted, errMsg, elapsed);
+        }, Qt::QueuedConnection);
+    });
+
+    connect(activeWorkerThread_, &QThread::finished, activeWorkerThread_, &QObject::deleteLater);
+    activeWorkerThread_->start();
+}
+
+void CTViewerWindow::onFilterCompleted(VolumeType::Pointer outVol, const QString& filterName, bool aborted, const QString& errMsg, qint64 elapsedMs) {
+    resetProcessUI();
+
+    if (aborted) {
+        statusPerfLabel_->setText("Filter stopped by user");
+        statusFilterLabel_->setText("Filter: Stopped");
+        return;
     }
 
-    progressBar_->setVisible(false);
-    QApplication::restoreOverrideCursor();
+    if (!errMsg.isEmpty()) {
+        QMessageBox::critical(this, "Filter Error", QString("Filter processing failed:\n%1").arg(errMsg));
+        statusPerfLabel_->setText("Filter error");
+        return;
+    }
+
+    filteredVolume_ = outVol;
+    displayVolume_ = filteredVolume_;
+    compareFilterCheck_->setChecked(false);
+    updateVolumeDisplay();
+
+    statusFilterLabel_->setText("Filter: " + filterName);
+    statusPerfLabel_->setText(QString("Filter finished in %1 ms").arg(elapsedMs));
 }
 
 void CTViewerWindow::onResetFilterClicked() {
@@ -1206,9 +1672,18 @@ void CTViewerWindow::onAlgorithmSelectionChanged(int index) {
 }
 
 void CTViewerWindow::onApplySegmentationClicked() {
-    if (!originalVolume_) {
-        QMessageBox::warning(this, "Warning", "Please load a dataset first.");
+    if (isProcessRunning_.load()) {
+        stopRunningProcess();
         return;
+    }
+
+    if (!originalVolume_) {
+        if (isLazyLoadingMode_) {
+            if (!ensureFullVolumeLoaded()) return;
+        } else {
+            QMessageBox::warning(this, "Warning", "Please load a dataset first.");
+            return;
+        }
     }
 
     VolumeType::Pointer inputVol = (segSourceFilteredRadio_->isChecked() && filteredVolume_)
@@ -1217,182 +1692,291 @@ void CTViewerWindow::onApplySegmentationClicked() {
 
     int algIdx = algorithmComboBox_->currentIndex();
 
+    isProcessRunning_.store(true);
+    cancelRequested_.store(false);
+
+    applySegBtn_->setText("■ Stop Segmentation");
+    applySegBtn_->setStyleSheet("background-color: #DC2626; font-weight: bold;");
+    applyFilterBtn_->setEnabled(false);
+
+    stopProcessBtn_->setVisible(true);
+    stopProcessBtn_->setEnabled(true);
+    stopProcessBtn_->setText("■ Stop");
     progressBar_->setVisible(true);
+    progressBar_->setRange(0, 100);
+    progressBar_->setValue(0);
+    if (stopProcessAct_) stopProcessAct_->setEnabled(true);
+
     QApplication::setOverrideCursor(Qt::WaitCursor);
-    statusPerfLabel_->setText("Running segmentation...");
-    QApplication::processEvents();
+    statusPerfLabel_->setText("Running segmentation... (Press Esc or click Stop to cancel)");
 
-    QElapsedTimer timer; timer.start();
+    // Capture parameters for worker thread
+    int lo = threshLowerSpin_->value();
+    int hi = threshUpperSpin_->value();
+    int numClasses = multiOtsuClassesSpin_->value();
+    int targetClass = multiOtsuTargetClassSpin_->value();
+    VolumeType::IndexType seed;
+    seed[0] = seedXSpin_->value();
+    seed[1] = seedYSpin_->value();
+    seed[2] = seedZSpin_->value();
+    double mult = regionGrowMultSpin_->value();
+    unsigned int iters = static_cast<unsigned int>(regionGrowIterSpin_->value());
+    unsigned int radius = static_cast<unsigned int>(regionGrowRadiusSpin_->value());
+    int connLo = connThreshLowerSpin_->value();
+    int connHi = connThreshUpperSpin_->value();
+    int k = kmeansClustersSpin_->value();
+    int targetCluster = kmeansTargetClusterSpin_->value();
+    double watershedLevel = watershedLevelSpin_->value();
+    double minVox = minVoxelVal_;
+    double maxVox = maxVoxelVal_;
 
-    try {
-        if (algIdx == 0) { // Threshold Range
-            int lo = threshLowerSpin_->value();
-            int hi = threshUpperSpin_->value();
-            using FilterType = itk::BinaryThresholdImageFilter<VolumeType, LabelVolumeType>;
-            auto filter = FilterType::New();
-            filter->SetInput(inputVol);
-            filter->SetLowerThreshold(lo);
-            filter->SetUpperThreshold(hi);
-            filter->SetInsideValue(1);
-            filter->SetOutsideValue(0);
-            filter->Update();
-            segmentationMask_ = filter->GetOutput();
-            statusSegLabel_->setText(QString("Alg: Threshold [%1, %2]").arg(lo).arg(hi));
-
-        } else if (algIdx == 1) { // Global Otsu
-            using FilterType = itk::OtsuThresholdImageFilter<VolumeType, LabelVolumeType>;
-            auto filter = FilterType::New();
-            filter->SetInput(inputVol);
-            filter->SetInsideValue(0);
-            filter->SetOutsideValue(1);
-            filter->Update();
-            segmentationMask_ = filter->GetOutput();
-            statusSegLabel_->setText(QString("Alg: Global Otsu (thresh=%1)").arg(filter->GetThreshold()));
-
-        } else if (algIdx == 2) { // Multi-Otsu
-            int numClasses = multiOtsuClassesSpin_->value();
-            int targetClass = multiOtsuTargetClassSpin_->value();
-
-            using FilterType = itk::OtsuMultipleThresholdsImageFilter<VolumeType, LabelVolumeType>;
-            auto filter = FilterType::New();
-            filter->SetInput(inputVol);
-            filter->SetNumberOfThresholds(numClasses - 1);
-            filter->Update();
-
-            // Extract target class as binary mask (1 for target, 0 otherwise)
-            auto rawMask = filter->GetOutput();
-            segmentationMask_ = LabelVolumeType::New();
-            segmentationMask_->SetRegions(rawMask->GetLargestPossibleRegion());
-            segmentationMask_->SetSpacing(rawMask->GetSpacing());
-            segmentationMask_->SetOrigin(rawMask->GetOrigin());
-            segmentationMask_->Allocate();
-
-            itk::ImageRegionConstIterator<LabelVolumeType> inIt(rawMask, rawMask->GetLargestPossibleRegion());
-            itk::ImageRegionIterator<LabelVolumeType> outIt(segmentationMask_, segmentationMask_->GetLargestPossibleRegion());
-            for (inIt.GoToBegin(), outIt.GoToBegin(); !inIt.IsAtEnd(); ++inIt, ++outIt) {
-                outIt.Set(inIt.Get() == targetClass ? 1 : 0);
-            }
-            statusSegLabel_->setText(QString("Alg: Multi-Otsu (%1 cls, target %2)").arg(numClasses).arg(targetClass));
-
-        } else if (algIdx == 3) { // Confidence Connected Region Growing
-            VolumeType::IndexType seed;
-            seed[0] = seedXSpin_->value();
-            seed[1] = seedYSpin_->value();
-            seed[2] = seedZSpin_->value();
-            double mult = regionGrowMultSpin_->value();
-            unsigned int iters = static_cast<unsigned int>(regionGrowIterSpin_->value());
-            unsigned int radius = static_cast<unsigned int>(regionGrowRadiusSpin_->value());
-
-            using GrowType = itk::ConfidenceConnectedImageFilter<VolumeType, VolumeType>;
-            auto grow = GrowType::New();
-            grow->SetInput(inputVol);
-            grow->AddSeed(seed);
-            grow->SetMultiplier(mult);
-            grow->SetNumberOfIterations(iters);
-            grow->SetInitialNeighborhoodRadius(radius);
-            grow->SetReplaceValue(1);
-            grow->Update();
-
-            using CastType = itk::CastImageFilter<VolumeType, LabelVolumeType>;
-            auto caster = CastType::New();
-            caster->SetInput(grow->GetOutput());
-            caster->Update();
-            segmentationMask_ = caster->GetOutput();
-
-            statusSegLabel_->setText(QString("Alg: Region Grow (seed: %1, %2, %3)").arg(seed[0]).arg(seed[1]).arg(seed[2]));
-
-        } else if (algIdx == 4) { // Connected Threshold
-            VolumeType::IndexType seed;
-            seed[0] = seedXSpin_->value();
-            seed[1] = seedYSpin_->value();
-            seed[2] = seedZSpin_->value();
-            int lo = connThreshLowerSpin_->value();
-            int hi = connThreshUpperSpin_->value();
-
-            using ConnType = itk::ConnectedThresholdImageFilter<VolumeType, LabelVolumeType>;
-            auto conn = ConnType::New();
-            conn->SetInput(inputVol);
-            conn->AddSeed(seed);
-            conn->SetLower(lo);
-            conn->SetUpper(hi);
-            conn->SetReplaceValue(1);
-            conn->Update();
-            segmentationMask_ = conn->GetOutput();
-
-            statusSegLabel_->setText(QString("Alg: Conn Thresh [%1, %2]").arg(lo).arg(hi));
-
-        } else if (algIdx == 5) { // K-Means Clustering
-            int k = kmeansClustersSpin_->value();
-            int targetCluster = kmeansTargetClusterSpin_->value();
-
-            using FilterType = itk::ScalarImageKmeansImageFilter<VolumeType>;
-            auto filter = FilterType::New();
-            filter->SetInput(inputVol);
-            for (int i = 0; i < k; ++i) {
-                double mean = minVoxelVal_ + (maxVoxelVal_ - minVoxelVal_) * (i + 0.5) / k;
-                filter->AddClassWithInitialMean(mean);
-            }
-            filter->Update();
-
-            auto rawMask = filter->GetOutput();
-            segmentationMask_ = LabelVolumeType::New();
-            segmentationMask_->SetRegions(rawMask->GetLargestPossibleRegion());
-            segmentationMask_->SetSpacing(rawMask->GetSpacing());
-            segmentationMask_->SetOrigin(rawMask->GetOrigin());
-            segmentationMask_->Allocate();
-
-            // ScalarImageKmeansImageFilter output pixel type is unsigned char
-            // (the cluster index), regardless of the input pixel type.
-            using KMeansOutputType = itk::Image<unsigned char, 3>;
-            itk::ImageRegionConstIterator<KMeansOutputType> inIt(rawMask, rawMask->GetLargestPossibleRegion());
-            itk::ImageRegionIterator<LabelVolumeType> outIt(segmentationMask_, segmentationMask_->GetLargestPossibleRegion());
-            for (inIt.GoToBegin(), outIt.GoToBegin(); !inIt.IsAtEnd(); ++inIt, ++outIt) {
-                outIt.Set(static_cast<int>(inIt.Get()) == targetCluster ? 1 : 0);
-            }
-
-            statusSegLabel_->setText(QString("Alg: K-Means (k=%1, target %2)").arg(k).arg(targetCluster));
-
-        } else if (algIdx == 6) { // Canny Morphology
-            // Run global Otsu + morphological closing for reliable 3D structure extraction
-            using OtsuType = itk::OtsuThresholdImageFilter<VolumeType, LabelVolumeType>;
-            auto otsu = OtsuType::New();
-            otsu->SetInput(inputVol);
-            otsu->SetInsideValue(0);
-            otsu->SetOutsideValue(1);
-            otsu->Update();
-            segmentationMask_ = otsu->GetOutput();
-            statusSegLabel_->setText("Alg: Canny Morphology");
-
-        } else if (algIdx == 7) { // Watershed Segmentation
-            // Adaptive threshold based watershed region extraction
-            double level = watershedLevelSpin_->value();
-            using FilterType = itk::OtsuThresholdImageFilter<VolumeType, LabelVolumeType>;
-            auto filter = FilterType::New();
-            filter->SetInput(inputVol);
-            filter->SetInsideValue(0);
-            filter->SetOutsideValue(1);
-            filter->Update();
-            segmentationMask_ = filter->GetOutput();
-            statusSegLabel_->setText(QString("Alg: Watershed (lvl=%1)").arg(level));
-        }
-
-        // Count foreground voxels
+    activeWorkerThread_ = QThread::create([this, inputVol, algIdx, lo, hi, numClasses, targetClass, seed, mult, iters, radius, connLo, connHi, k, targetCluster, watershedLevel, minVox, maxVox]() {
+        LabelVolumeType::Pointer outMask = nullptr;
+        QString segName;
+        bool aborted = false;
+        QString errMsg;
         long fgCount = 0;
-        if (segmentationMask_) {
-            itk::ImageRegionConstIterator<LabelVolumeType> it(segmentationMask_, segmentationMask_->GetLargestPossibleRegion());
-            for (it.GoToBegin(); !it.IsAtEnd(); ++it) if (it.Get() > 0) fgCount++;
+        QElapsedTimer timer; timer.start();
+
+        auto makeObserver = [this]() {
+            auto observer = itk::CStyleCommand::New();
+            observer->SetClientData(this);
+            observer->SetCallback([](itk::Object* caller, const itk::EventObject&, void* clientData) {
+                auto* self = static_cast<CTViewerWindow*>(clientData);
+                if (self->cancelRequested_.load()) {
+                    if (auto* po = dynamic_cast<itk::ProcessObject*>(caller)) {
+                        po->SetAbortGenerateData(true);
+                    }
+                } else if (auto* po = dynamic_cast<itk::ProcessObject*>(caller)) {
+                    int pct = static_cast<int>(po->GetProgress() * 100);
+                    QMetaObject::invokeMethod(self, [self, pct]() {
+                        if (self->isProcessRunning_.load()) {
+                            self->progressBar_->setValue(pct);
+                        }
+                    }, Qt::QueuedConnection);
+                }
+            });
+            return observer;
+        };
+
+        try {
+            if (algIdx == 0) { // Threshold Range
+                using FilterType = itk::BinaryThresholdImageFilter<VolumeType, LabelVolumeType>;
+                auto filter = FilterType::New();
+                filter->SetInput(inputVol);
+                filter->SetLowerThreshold(lo);
+                filter->SetUpperThreshold(hi);
+                filter->SetInsideValue(1);
+                filter->SetOutsideValue(0);
+                currentProcessObject_ = filter;
+                filter->AddObserver(itk::ProgressEvent(), makeObserver());
+                filter->Update();
+                if (cancelRequested_.load()) aborted = true;
+                else {
+                    outMask = filter->GetOutput();
+                    segName = QString("Threshold [%1, %2]").arg(lo).arg(hi);
+                }
+
+            } else if (algIdx == 1) { // Global Otsu
+                using FilterType = itk::OtsuThresholdImageFilter<VolumeType, LabelVolumeType>;
+                auto filter = FilterType::New();
+                filter->SetInput(inputVol);
+                filter->SetInsideValue(0);
+                filter->SetOutsideValue(1);
+                currentProcessObject_ = filter;
+                filter->AddObserver(itk::ProgressEvent(), makeObserver());
+                filter->Update();
+                if (cancelRequested_.load()) aborted = true;
+                else {
+                    outMask = filter->GetOutput();
+                    segName = QString("Global Otsu (thresh=%1)").arg(filter->GetThreshold());
+                }
+
+            } else if (algIdx == 2) { // Multi-Otsu
+                using FilterType = itk::OtsuMultipleThresholdsImageFilter<VolumeType, LabelVolumeType>;
+                auto filter = FilterType::New();
+                filter->SetInput(inputVol);
+                filter->SetNumberOfThresholds(numClasses - 1);
+                currentProcessObject_ = filter;
+                filter->AddObserver(itk::ProgressEvent(), makeObserver());
+                filter->Update();
+
+                if (cancelRequested_.load()) aborted = true;
+                else {
+                    auto rawMask = filter->GetOutput();
+                    outMask = LabelVolumeType::New();
+                    outMask->SetRegions(rawMask->GetLargestPossibleRegion());
+                    outMask->SetSpacing(rawMask->GetSpacing());
+                    outMask->SetOrigin(rawMask->GetOrigin());
+                    outMask->Allocate();
+
+                    itk::ImageRegionConstIterator<LabelVolumeType> inIt(rawMask, rawMask->GetLargestPossibleRegion());
+                    itk::ImageRegionIterator<LabelVolumeType> oIt(outMask, outMask->GetLargestPossibleRegion());
+                    for (inIt.GoToBegin(), oIt.GoToBegin(); !inIt.IsAtEnd(); ++inIt, ++oIt) {
+                        if (cancelRequested_.load()) { aborted = true; break; }
+                        oIt.Set(inIt.Get() == targetClass ? 1 : 0);
+                    }
+                    segName = QString("Multi-Otsu (%1 cls, target %2)").arg(numClasses).arg(targetClass);
+                }
+
+            } else if (algIdx == 3) { // Confidence Connected Region Growing
+                using GrowType = itk::ConfidenceConnectedImageFilter<VolumeType, VolumeType>;
+                auto grow = GrowType::New();
+                grow->SetInput(inputVol);
+                grow->AddSeed(seed);
+                grow->SetMultiplier(mult);
+                grow->SetNumberOfIterations(iters);
+                grow->SetInitialNeighborhoodRadius(radius);
+                grow->SetReplaceValue(1);
+                currentProcessObject_ = grow;
+                grow->AddObserver(itk::ProgressEvent(), makeObserver());
+                grow->AddObserver(itk::IterationEvent(), makeObserver());
+                grow->Update();
+
+                if (cancelRequested_.load()) aborted = true;
+                else {
+                    using CastType = itk::CastImageFilter<VolumeType, LabelVolumeType>;
+                    auto caster = CastType::New();
+                    caster->SetInput(grow->GetOutput());
+                    currentProcessObject_ = caster;
+                    caster->Update();
+
+                    if (cancelRequested_.load()) aborted = true;
+                    else {
+                        outMask = caster->GetOutput();
+                        segName = QString("Region Grow (seed: %1, %2, %3)").arg(seed[0]).arg(seed[1]).arg(seed[2]);
+                    }
+                }
+
+            } else if (algIdx == 4) { // Connected Threshold
+                using ConnType = itk::ConnectedThresholdImageFilter<VolumeType, LabelVolumeType>;
+                auto conn = ConnType::New();
+                conn->SetInput(inputVol);
+                conn->AddSeed(seed);
+                conn->SetLower(connLo);
+                conn->SetUpper(connHi);
+                conn->SetReplaceValue(1);
+                currentProcessObject_ = conn;
+                conn->AddObserver(itk::ProgressEvent(), makeObserver());
+                conn->Update();
+
+                if (cancelRequested_.load()) aborted = true;
+                else {
+                    outMask = conn->GetOutput();
+                    segName = QString("Conn Thresh [%1, %2]").arg(connLo).arg(connHi);
+                }
+
+            } else if (algIdx == 5) { // K-Means Clustering
+                using FilterType = itk::ScalarImageKmeansImageFilter<VolumeType>;
+                auto filter = FilterType::New();
+                filter->SetInput(inputVol);
+                for (int i = 0; i < k; ++i) {
+                    double mean = minVox + (maxVox - minVox) * (i + 0.5) / k;
+                    filter->AddClassWithInitialMean(mean);
+                }
+                currentProcessObject_ = filter;
+                filter->AddObserver(itk::ProgressEvent(), makeObserver());
+                filter->Update();
+
+                if (cancelRequested_.load()) aborted = true;
+                else {
+                    auto rawMask = filter->GetOutput();
+                    outMask = LabelVolumeType::New();
+                    outMask->SetRegions(rawMask->GetLargestPossibleRegion());
+                    outMask->SetSpacing(rawMask->GetSpacing());
+                    outMask->SetOrigin(rawMask->GetOrigin());
+                    outMask->Allocate();
+
+                    using KMeansOutputType = itk::Image<unsigned char, 3>;
+                    itk::ImageRegionConstIterator<KMeansOutputType> inIt(rawMask, rawMask->GetLargestPossibleRegion());
+                    itk::ImageRegionIterator<LabelVolumeType> oIt(outMask, outMask->GetLargestPossibleRegion());
+                    for (inIt.GoToBegin(), oIt.GoToBegin(); !inIt.IsAtEnd(); ++inIt, ++oIt) {
+                        if (cancelRequested_.load()) { aborted = true; break; }
+                        oIt.Set(static_cast<int>(inIt.Get()) == targetCluster ? 1 : 0);
+                    }
+                    segName = QString("K-Means (k=%1, target %2)").arg(k).arg(targetCluster);
+                }
+
+            } else if (algIdx == 6) { // Canny Morphology
+                using OtsuType = itk::OtsuThresholdImageFilter<VolumeType, LabelVolumeType>;
+                auto otsu = OtsuType::New();
+                otsu->SetInput(inputVol);
+                otsu->SetInsideValue(0);
+                otsu->SetOutsideValue(1);
+                currentProcessObject_ = otsu;
+                otsu->AddObserver(itk::ProgressEvent(), makeObserver());
+                otsu->Update();
+
+                if (cancelRequested_.load()) aborted = true;
+                else {
+                    outMask = otsu->GetOutput();
+                    segName = "Canny Morphology";
+                }
+
+            } else if (algIdx == 7) { // Watershed Segmentation
+                using FilterType = itk::OtsuThresholdImageFilter<VolumeType, LabelVolumeType>;
+                auto filter = FilterType::New();
+                filter->SetInput(inputVol);
+                filter->SetInsideValue(0);
+                filter->SetOutsideValue(1);
+                currentProcessObject_ = filter;
+                filter->AddObserver(itk::ProgressEvent(), makeObserver());
+                filter->Update();
+
+                if (cancelRequested_.load()) aborted = true;
+                else {
+                    outMask = filter->GetOutput();
+                    segName = QString("Watershed (lvl=%1)").arg(watershedLevel);
+                }
+            }
+
+            if (outMask && !aborted && !cancelRequested_.load()) {
+                itk::ImageRegionConstIterator<LabelVolumeType> it(outMask, outMask->GetLargestPossibleRegion());
+                for (it.GoToBegin(); !it.IsAtEnd(); ++it) {
+                    if (cancelRequested_.load()) { aborted = true; break; }
+                    if (it.Get() > 0) fgCount++;
+                }
+            }
+        } catch (const itk::ProcessAborted&) {
+            aborted = true;
+        } catch (const std::exception& e) {
+            if (cancelRequested_.load()) {
+                aborted = true;
+            } else {
+                errMsg = QString::fromUtf8(e.what());
+            }
         }
 
-        updateMaskDisplay();
-        statusPerfLabel_->setText(QString("Segmentation finished in %1 ms (%2 voxels)").arg(timer.elapsed()).arg(fgCount));
+        if (cancelRequested_.load()) aborted = true;
 
-    } catch (const std::exception& e) {
-        QMessageBox::critical(this, "Segmentation Error", QString("Segmentation failed:\n%1").arg(e.what()));
-        statusPerfLabel_->setText("Segmentation error");
+        QMetaObject::invokeMethod(this, [this, outMask, segName, aborted, errMsg, fgCount, elapsed = timer.elapsed()]() {
+            onSegmentationCompleted(outMask, segName, aborted, errMsg, fgCount, elapsed);
+        }, Qt::QueuedConnection);
+    });
+
+    connect(activeWorkerThread_, &QThread::finished, activeWorkerThread_, &QObject::deleteLater);
+    activeWorkerThread_->start();
+}
+
+void CTViewerWindow::onSegmentationCompleted(LabelVolumeType::Pointer outMask, const QString& segName, bool aborted, const QString& errMsg, long fgCount, qint64 elapsedMs) {
+    resetProcessUI();
+
+    if (aborted) {
+        statusPerfLabel_->setText("Segmentation stopped by user");
+        statusSegLabel_->setText("Segmentation: Stopped");
+        return;
     }
 
-    progressBar_->setVisible(false);
-    QApplication::restoreOverrideCursor();
+    if (!errMsg.isEmpty()) {
+        QMessageBox::critical(this, "Segmentation Error", QString("Segmentation failed:\n%1").arg(errMsg));
+        statusPerfLabel_->setText("Segmentation error");
+        return;
+    }
+
+    segmentationMask_ = outMask;
+    updateMaskDisplay();
+    statusSegLabel_->setText("Alg: " + segName);
+    statusPerfLabel_->setText(QString("Segmentation finished in %1 ms (%2 voxels)").arg(elapsedMs).arg(fgCount));
 }
 
 void CTViewerWindow::onClearSegmentationClicked() {
@@ -1488,6 +2072,11 @@ void CTViewerWindow::onFillColorChanged(int index) {
 // -------------------------------------------------------------------------
 
 void CTViewerWindow::onExportFilteredClicked() {
+    if (isProcessRunning_.load()) {
+        stopRunningProcess();
+        return;
+    }
+
     VolumeType::Pointer volToSave = filteredVolume_ ? filteredVolume_ : originalVolume_;
     if (!volToSave) {
         QMessageBox::warning(this, "Export", "No image data available to export.");
@@ -1500,19 +2089,46 @@ void CTViewerWindow::onExportFilteredClicked() {
         QString dir = QFileDialog::getExistingDirectory(this, "Select Directory to Save Filtered TIFF Stack", QString::fromStdString(currentDatasetPath_));
         if (dir.isEmpty()) return;
 
+        isProcessRunning_.store(true);
+        cancelRequested_.store(false);
+        stopProcessBtn_->setVisible(true);
+        stopProcessBtn_->setEnabled(true);
+        stopProcessBtn_->setText("■ Stop");
         progressBar_->setVisible(true);
+        progressBar_->setRange(0, 100);
+        progressBar_->setValue(0);
+        if (stopProcessAct_) stopProcessAct_->setEnabled(true);
         QApplication::setOverrideCursor(Qt::WaitCursor);
-        QApplication::processEvents();
+        statusPerfLabel_->setText("Exporting TIFF stack... (Click Stop or press Esc to cancel)");
 
+        unsigned int numZ = static_cast<unsigned int>(volToSave->GetLargestPossibleRegion().GetSize()[2]);
+        bool aborted = false;
+        unsigned int savedCount = 0;
         try {
-            VolumeIO::saveVolumeAsTiffSeries(volToSave, dir.toStdString(), "filtered_recon_");
-            QMessageBox::information(this, "Export Success", QString("Saved filtered 3D TIFF stack to:\n%1").arg(dir));
-            statusPerfLabel_->setText("Filtered TIFF stack exported successfully");
+            std::filesystem::create_directories(dir.toStdString());
+            for (unsigned int z = 0; z < numZ; ++z) {
+                if (cancelRequested_.load()) {
+                    aborted = true;
+                    break;
+                }
+                std::ostringstream ss;
+                ss << dir.toStdString() << "/filtered_recon_" << std::setw(4) << std::setfill('0') << z << ".tif";
+                VolumeIO::saveSliceAsTIFF(volToSave, z, ss.str());
+                savedCount++;
+                progressBar_->setValue(static_cast<int>((z + 1) * 100 / numZ));
+                QApplication::processEvents();
+            }
+            if (aborted) {
+                statusPerfLabel_->setText(QString("Export stopped by user after %1/%2 slices").arg(savedCount).arg(numZ));
+            } else {
+                QMessageBox::information(this, "Export Success", QString("Saved filtered 3D TIFF stack to:\n%1").arg(dir));
+                statusPerfLabel_->setText("Filtered TIFF stack exported successfully");
+            }
         } catch (const std::exception& e) {
             QMessageBox::critical(this, "Export Error", QString("Failed to save TIFF stack:\n%1").arg(e.what()));
+            statusPerfLabel_->setText("Export error");
         }
-        progressBar_->setVisible(false);
-        QApplication::restoreOverrideCursor();
+        resetProcessUI();
     } else {
         QString file = QFileDialog::getSaveFileName(this, "Save Filtered Slice as TIFF", "filtered_slice.tif", "TIFF Files (*.tif *.tiff)");
         if (file.isEmpty()) return;
@@ -1529,6 +2145,11 @@ void CTViewerWindow::onExportFilteredClicked() {
 }
 
 void CTViewerWindow::onExportMaskClicked() {
+    if (isProcessRunning_.load()) {
+        stopRunningProcess();
+        return;
+    }
+
     if (!segmentationMask_) {
         QMessageBox::warning(this, "Export", "No segmentation mask available. Apply segmentation first.");
         return;
@@ -1540,19 +2161,46 @@ void CTViewerWindow::onExportMaskClicked() {
         QString dir = QFileDialog::getExistingDirectory(this, "Select Directory to Save Segmentation Mask Stack", QString::fromStdString(currentDatasetPath_));
         if (dir.isEmpty()) return;
 
+        isProcessRunning_.store(true);
+        cancelRequested_.store(false);
+        stopProcessBtn_->setVisible(true);
+        stopProcessBtn_->setEnabled(true);
+        stopProcessBtn_->setText("■ Stop");
         progressBar_->setVisible(true);
+        progressBar_->setRange(0, 100);
+        progressBar_->setValue(0);
+        if (stopProcessAct_) stopProcessAct_->setEnabled(true);
         QApplication::setOverrideCursor(Qt::WaitCursor);
-        QApplication::processEvents();
+        statusPerfLabel_->setText("Exporting mask stack... (Click Stop or press Esc to cancel)");
 
+        unsigned int numZ = static_cast<unsigned int>(segmentationMask_->GetLargestPossibleRegion().GetSize()[2]);
+        bool aborted = false;
+        unsigned int savedCount = 0;
         try {
-            VolumeIO::saveLabelVolumeAsTiffSeries(segmentationMask_, dir.toStdString(), "mask_slice_");
-            QMessageBox::information(this, "Export Success", QString("Saved segmentation mask TIFF stack to:\n%1").arg(dir));
-            statusPerfLabel_->setText("Mask TIFF stack exported successfully");
+            std::filesystem::create_directories(dir.toStdString());
+            for (unsigned int z = 0; z < numZ; ++z) {
+                if (cancelRequested_.load()) {
+                    aborted = true;
+                    break;
+                }
+                std::ostringstream ss;
+                ss << dir.toStdString() << "/mask_slice_" << std::setw(4) << std::setfill('0') << z << ".tif";
+                VolumeIO::saveLabelSliceAsTIFF(segmentationMask_, z, ss.str());
+                savedCount++;
+                progressBar_->setValue(static_cast<int>((z + 1) * 100 / numZ));
+                QApplication::processEvents();
+            }
+            if (aborted) {
+                statusPerfLabel_->setText(QString("Mask export stopped by user after %1/%2 slices").arg(savedCount).arg(numZ));
+            } else {
+                QMessageBox::information(this, "Export Success", QString("Saved segmentation mask TIFF stack to:\n%1").arg(dir));
+                statusPerfLabel_->setText("Mask TIFF stack exported successfully");
+            }
         } catch (const std::exception& e) {
             QMessageBox::critical(this, "Export Error", QString("Failed to save mask stack:\n%1").arg(e.what()));
+            statusPerfLabel_->setText("Export error");
         }
-        progressBar_->setVisible(false);
-        QApplication::restoreOverrideCursor();
+        resetProcessUI();
     } else {
         QString file = QFileDialog::getSaveFileName(this, "Save Mask Slice as TIFF", "mask_slice.tif", "TIFF Files (*.tif *.tiff)");
         if (file.isEmpty()) return;
@@ -1569,6 +2217,11 @@ void CTViewerWindow::onExportMaskClicked() {
 }
 
 void CTViewerWindow::onExportMaskedCTClicked() {
+    if (isProcessRunning_.load()) {
+        stopRunningProcess();
+        return;
+    }
+
     VolumeType::Pointer ctVol = filteredVolume_ ? filteredVolume_ : originalVolume_;
     if (!ctVol || !segmentationMask_) {
         QMessageBox::warning(this, "Export", "Requires both loaded CT volume and active segmentation mask.");
@@ -1581,19 +2234,46 @@ void CTViewerWindow::onExportMaskedCTClicked() {
         QString dir = QFileDialog::getExistingDirectory(this, "Select Directory to Save Masked CT Stack", QString::fromStdString(currentDatasetPath_));
         if (dir.isEmpty()) return;
 
+        isProcessRunning_.store(true);
+        cancelRequested_.store(false);
+        stopProcessBtn_->setVisible(true);
+        stopProcessBtn_->setEnabled(true);
+        stopProcessBtn_->setText("■ Stop");
         progressBar_->setVisible(true);
+        progressBar_->setRange(0, 100);
+        progressBar_->setValue(0);
+        if (stopProcessAct_) stopProcessAct_->setEnabled(true);
         QApplication::setOverrideCursor(Qt::WaitCursor);
-        QApplication::processEvents();
+        statusPerfLabel_->setText("Exporting masked CT stack... (Click Stop or press Esc to cancel)");
 
+        unsigned int numZ = static_cast<unsigned int>(ctVol->GetLargestPossibleRegion().GetSize()[2]);
+        bool aborted = false;
+        unsigned int savedCount = 0;
         try {
-            VolumeIO::saveMaskedCTVolumeAsTiffSeries(ctVol, segmentationMask_, dir.toStdString(), "roi_ct_slice_");
-            QMessageBox::information(this, "Export Success", QString("Saved masked CT TIFF stack to:\n%1").arg(dir));
-            statusPerfLabel_->setText("Masked CT stack exported successfully");
+            std::filesystem::create_directories(dir.toStdString());
+            for (unsigned int z = 0; z < numZ; ++z) {
+                if (cancelRequested_.load()) {
+                    aborted = true;
+                    break;
+                }
+                std::ostringstream ss;
+                ss << dir.toStdString() << "/roi_ct_slice_" << std::setw(4) << std::setfill('0') << z << ".tif";
+                VolumeIO::saveMaskedSliceAsTIFF(ctVol, segmentationMask_, z, ss.str());
+                savedCount++;
+                progressBar_->setValue(static_cast<int>((z + 1) * 100 / numZ));
+                QApplication::processEvents();
+            }
+            if (aborted) {
+                statusPerfLabel_->setText(QString("Masked CT export stopped by user after %1/%2 slices").arg(savedCount).arg(numZ));
+            } else {
+                QMessageBox::information(this, "Export Success", QString("Saved masked CT TIFF stack to:\n%1").arg(dir));
+                statusPerfLabel_->setText("Masked CT stack exported successfully");
+            }
         } catch (const std::exception& e) {
             QMessageBox::critical(this, "Export Error", QString("Failed to save masked CT stack:\n%1").arg(e.what()));
+            statusPerfLabel_->setText("Export error");
         }
-        progressBar_->setVisible(false);
-        QApplication::restoreOverrideCursor();
+        resetProcessUI();
     } else {
         QString file = QFileDialog::getSaveFileName(this, "Save Masked CT Slice as TIFF", "roi_ct_slice.tif", "TIFF Files (*.tif *.tiff)");
         if (file.isEmpty()) return;
@@ -1649,6 +2329,8 @@ void CTViewerWindow::updateStatusInfo() {
         if (displayVolume_->GetLargestPossibleRegion().IsInside(idx)) {
             val = static_cast<double>(displayVolume_->GetPixel(idx));
         }
+    } else if (isLazyLoadingMode_ && sliceStore_) {
+        val = sliceStore_->getVoxelValue(currentCursor_[0], currentCursor_[1], currentCursor_[2]);
     }
     statusVoxelLabel_->setText(
         QString("Pos: (%1, %2, %3) | Val: %4 | Slice: Z=%5 Y=%6 X=%7")
@@ -1675,6 +2357,11 @@ void CTViewerWindow::runTestSeedAndGrow(int x, int y, int z) {
     onApplySegmentationClicked();
     onShowBoundaryToggled(true);
     onShowFillToggled(true);
+
+    while (isProcessRunning_.load()) {
+        QApplication::processEvents();
+        QThread::msleep(10);
+    }
 }
 
 bool CTViewerWindow::saveScreenshot(const std::string& pngPath) {

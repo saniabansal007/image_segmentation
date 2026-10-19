@@ -65,6 +65,11 @@ public:
     void setVolumeData(vtkImageData* grayData, VolumeType::Pointer itkVol);
     void setMaskData(vtkImageData* maskData, LabelVolumeType::Pointer itkMask);
 
+    // Lazy loading 2D slice support
+    void initGeometry(int dimX, int dimY, int dimZ, const double spacing[3], const double origin[3]);
+    void setSliceData2D(const uint16_t* data, int width, int height, int sliceIndex);
+    bool isLazyMode() const { return isLazyMode_; }
+
     void setSlice(int sliceIndex);
     int currentSlice() const;
     int minSlice() const;
@@ -172,6 +177,18 @@ private:
     float boundaryWidth_ = 2.5f;
     bool crosshairVisible_ = true;
     int cursorCoords_[3] = {0, 0, 0};
+
+    // Lazy 2D slice geometry
+    bool isLazyMode_ = false;
+    int dimX_ = 0;
+    int dimY_ = 0;
+    int dimZ_ = 0;
+    double spacing_[3] = {1.0, 1.0, 1.0};
+    double origin_[3] = {0.0, 0.0, 0.0};
+    double fullBounds_[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    int currentSliceIndex_ = 0;
+    int minSliceIndex_ = 0;
+    int maxSliceIndex_ = 0;
 };
 
 } // namespace ctseg

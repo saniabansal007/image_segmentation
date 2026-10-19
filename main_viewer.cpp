@@ -31,14 +31,19 @@ int main(int argc, char** argv) {
         } else if (arg == "--screenshot" && i + 1 < argc) {
             screenshotPath = argv[i + 1];
             i += 1;
+        } else if ((arg == "--preprocessed" || arg == "--lazy") && i + 1 < argc) {
+            inputPath = argv[i + 1];
+            i += 1;
         } else if (arg.rfind("--", 0) != 0 && inputPath.empty()) {
             inputPath = arg;
         }
     }
 
-    // Default to ./data or ../data if exists and no input path specified
+    // Default: Check data_preprocessed first, then ./data, then ../data
     if (inputPath.empty()) {
-        if (std::filesystem::exists("./data")) inputPath = "./data";
+        if (std::filesystem::exists("./data_preprocessed/manifest.json")) inputPath = "./data_preprocessed";
+        else if (std::filesystem::exists("data_preprocessed/manifest.json")) inputPath = "data_preprocessed";
+        else if (std::filesystem::exists("./data")) inputPath = "./data";
         else if (std::filesystem::exists("../data")) inputPath = "../data";
     }
 

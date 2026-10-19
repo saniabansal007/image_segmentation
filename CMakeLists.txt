@@ -53,9 +53,23 @@ target_link_libraries(ct_segmentation_3d ${ITK_LIBRARIES})
 add_executable(test_roi_processor tools/test_roi_processor.cpp)
 target_link_libraries(test_roi_processor ${ITK_LIBRARIES})
 
-# ct_viewer: Qt6 + VTK interactive window
+# ct_preprocess: One-time preprocessing and multi-plane slice extraction
+add_executable(ct_preprocess
+    tools/ct_preprocess.cpp
+    volume/SliceStore.cpp)
+target_link_libraries(ct_preprocess ${ITK_LIBRARIES})
+
+# test_lazy_loading: Unit & verification tests for SliceStore and SliceCache
+add_executable(test_lazy_loading
+    tools/test_lazy_loading.cpp
+    volume/SliceStore.cpp)
+target_link_libraries(test_lazy_loading ${ITK_LIBRARIES})
+
+
+# ct_viewer: Qt6 + VTK interactive window with lazy slice loading
 add_executable(ct_viewer
     main_viewer.cpp
+    volume/SliceStore.cpp
     viewer/OrthoSliceView.cpp
     viewer/CTViewerWindow.cpp)
 target_link_libraries(ct_viewer

@@ -251,7 +251,118 @@ void OrthoSliceView::setupVTKPipeline() {
     }
 }
 
+void OrthoSliceView::initGeometry(int dimX, int dimY, int dimZ, const double spacing[3], const double origin[3]) {
+    isLazyMode_ = true;
+    dimX_ = dimX;
+    dimY_ = dimY;
+    dimZ_ = dimZ;
+    for (int i = 0; i < 3; ++i) {
+        spacing_[i] = spacing[i];
+        origin_[i] = origin[i];
+    }
+    fullBounds_[0] = origin_[0];
+    fullBounds_[1] = origin_[0] + (dimX_ - 1) * spacing_[0];
+    fullBounds_[2] = origin_[1];
+    fullBounds_[3] = origin_[1] + (dimY_ - 1) * spacing_[1];
+    fullBounds_[4] = origin_[2];
+    fullBounds_[5] = origin_[2] + (dimZ_ - 1) * spacing_[2];
+
+    minSliceIndex_ = 0;
+    if (orientation_ == 2) maxSliceIndex_ = dimZ_ - 1;
+    else if (orientation_ == 1) maxSliceIndex_ = dimY_ - 1;
+    else maxSliceIndex_ = dimX_ - 1;
+
+    sliceSlider_->blockSignals(true);
+    sliceSpinBox_->blockSignals(true);
+    sliceSlider_->setRange(minSliceIndex_, maxSliceIndex_);
+    sliceSpinBox_->setRange(minSliceIndex_, maxSliceIndex_);
+    currentSliceIndex_ = (minSliceIndex_ + maxSliceIndex_) / 2;
+    sliceSlider_->setValue(currentSliceIndex_);
+    sliceSpinBox_->setValue(currentSliceIndex_);
+    sliceSlider_->blockSignals(false);
+    sliceSpinBox_->blockSignals(false);
+
+    // Create a 2D vtkImageData buffer for this view tile
+    if (!grayData_) {
+        grayData_ = vtkSmartPointer<vtkImageData>::New();
+    }
+    grayData_->SetSpacing(spacing_[0], spacing_[1], spacing_[2]);
+    grayData_->SetOrigin(origin_[0], origin_[1], origin_[2]);
+
+    int ext[6] = {0, 0, 0, 0, 0, 0};
+    if (orientation_ == 2) {
+        ext[0] = 0; ext[1] = dimX_ - 1;
+        ext[2] = 0; ext[3] = dimY_ - 1;
+        ext[4] = currentSliceIndex_; ext[5] = currentSliceIndex_;
+    } else if (orientation_ == 1) {
+        ext[0] = 0; ext[1] = dimX_ - 1;
+        ext[2] = currentSliceIndex_; ext[3] = currentSliceIndex_;
+        ext[4] = 0; ext[5] = dimZ_ - 1;
+    } else {
+        ext[0] = currentSliceIndex_; ext[1] = currentSliceIndex_;
+        ext[2] = 0; ext[3] = dimY_ - 1;
+        ext[4] = 0; ext[5] = dimZ_ - 1;
+    }
+    grayData_->SetExtent(ext);
+    grayData_->AllocateScalars(VTK_UNSIGNED_SHORT, 1);
+    std::memset(grayData_->GetScalarPointer(), 0, grayData_->GetNumberOfPoints() * sizeof(uint16_t));
+    grayData_->Modified();
+
+    grayMapper_->SetInputData(grayData_);
+    grayMapper_->SetOrientation(orientation_);
+    grayMapper_->SetSliceNumber(currentSliceIndex_);
+
+    resetCamera();
+    updateBadgeText();
+    updateCrosshairs();
+    render();
+}
+
+void OrthoSliceView::setSliceData2D(const uint16_t* data, int width, int height, int sliceIndex) {
+    if (!grayData_ || !data) return;
+
+    currentSliceIndex_ = std::max(minSliceIndex_, std::min(maxSliceIndex_, sliceIndex));
+
+    int ext[6] = {0, 0, 0, 0, 0, 0};
+    if (orientation_ == 2) {
+        ext[0] = 0; ext[1] = dimX_ - 1;
+        ext[2] = 0; ext[3] = dimY_ - 1;
+        ext[4] = currentSliceIndex_; ext[5] = currentSliceIndex_;
+    } else if (orientation_ == 1) {
+        ext[0] = 0; ext[1] = dimX_ - 1;
+        ext[2] = currentSliceIndex_; ext[3] = currentSliceIndex_;
+        ext[4] = 0; ext[5] = dimZ_ - 1;
+    } else {
+        ext[0] = currentSliceIndex_; ext[1] = currentSliceIndex_;
+        ext[2] = 0; ext[3] = dimY_ - 1;
+        ext[4] = 0; ext[5] = dimZ_ - 1;
+    }
+    grayData_->SetExtent(ext);
+
+    void* ptr = grayData_->GetScalarPointer();
+    if (ptr) {
+        size_t numPixels = static_cast<size_t>(width) * static_cast<size_t>(height);
+        std::memcpy(ptr, data, numPixels * sizeof(uint16_t));
+    }
+    grayData_->Modified();
+    grayMapper_->SetSliceNumber(currentSliceIndex_);
+    maskFillMapper_->SetSliceNumber(currentSliceIndex_);
+
+    sliceSlider_->blockSignals(true);
+    sliceSpinBox_->blockSignals(true);
+    sliceSlider_->setValue(currentSliceIndex_);
+    sliceSpinBox_->setValue(currentSliceIndex_);
+    sliceSlider_->blockSignals(false);
+    sliceSpinBox_->blockSignals(false);
+
+    updateBadgeText();
+    updateCrosshairs();
+    updateContour();
+    render();
+}
+
 void OrthoSliceView::setVolumeData(vtkImageData* grayData, VolumeType::Pointer itkVol) {
+    isLazyMode_ = false;
     grayData_ = grayData;
     itkVolume_ = itkVol;
 
@@ -287,6 +398,10 @@ void OrthoSliceView::setMaskData(vtkImageData* maskData, LabelVolumeType::Pointe
     maskFillMapper_->SetInputData(maskData_);
     extractVOI_->SetInputData(maskData_);
 
+    if (maskData_) {
+        maskFillMapper_->SetSliceNumber(currentSlice());
+    }
+
     updateContour();
     render();
 }
@@ -296,7 +411,9 @@ void OrthoSliceView::setSlice(int sliceIndex) {
     int maxS = maxSlice();
     int s = std::max(minS, std::min(maxS, sliceIndex));
 
-    if (currentSlice() == s) return;
+    if (currentSlice() == s && (!isLazyMode_ || currentSliceIndex_ == s)) return;
+
+    currentSliceIndex_ = s;
 
     sliceSlider_->blockSignals(true);
     sliceSpinBox_->blockSignals(true);
@@ -305,24 +422,34 @@ void OrthoSliceView::setSlice(int sliceIndex) {
     sliceSlider_->blockSignals(false);
     sliceSpinBox_->blockSignals(false);
 
-    grayMapper_->SetSliceNumber(s);
-    maskFillMapper_->SetSliceNumber(s);
-
-    updateBadgeText();
-    updateCrosshairs();
-    updateContour();
-    render();
+    if (!isLazyMode_) {
+        grayMapper_->SetSliceNumber(s);
+        maskFillMapper_->SetSliceNumber(s);
+        updateBadgeText();
+        updateCrosshairs();
+        updateContour();
+        render();
+    } else {
+        maskFillMapper_->SetSliceNumber(s);
+        updateBadgeText();
+        updateCrosshairs();
+        updateContour();
+        render();
+    }
 }
 
 int OrthoSliceView::currentSlice() const {
+    if (isLazyMode_) return currentSliceIndex_;
     return grayMapper_->GetSliceNumber();
 }
 
 int OrthoSliceView::minSlice() const {
+    if (isLazyMode_) return minSliceIndex_;
     return grayMapper_->GetSliceNumberMinValue();
 }
 
 int OrthoSliceView::maxSlice() const {
+    if (isLazyMode_) return maxSliceIndex_;
     return grayMapper_->GetSliceNumberMaxValue();
 }
 
@@ -392,6 +519,11 @@ void OrthoSliceView::setFillColor(double r, double g, double b) {
 }
 
 void OrthoSliceView::resetCamera() {
+    if (isLazyMode_) {
+        renderer_->ResetCamera(fullBounds_);
+        render();
+        return;
+    }
     if (!grayData_) return;
     double bounds[6];
     grayData_->GetBounds(bounds);
@@ -438,11 +570,20 @@ void OrthoSliceView::updateCrosshairs() {
     }
 
     double bounds[6];
-    grayData_->GetBounds(bounds);
     double spacing[3];
-    grayData_->GetSpacing(spacing);
     double origin[3];
-    grayData_->GetOrigin(origin);
+
+    if (isLazyMode_) {
+        for (int i = 0; i < 6; ++i) bounds[i] = fullBounds_[i];
+        for (int i = 0; i < 3; ++i) {
+            spacing[i] = spacing_[i];
+            origin[i] = origin_[i];
+        }
+    } else {
+        grayData_->GetBounds(bounds);
+        grayData_->GetSpacing(spacing);
+        grayData_->GetOrigin(origin);
+    }
 
     double wx = origin[0] + cursorCoords_[0] * spacing[0];
     double wy = origin[1] + cursorCoords_[1] * spacing[1];
@@ -481,10 +622,20 @@ void OrthoSliceView::updateBadgeText() {
 }
 
 bool OrthoSliceView::worldToIndex(const double world[3], VolumeType::IndexType& idx) const {
-    if (!itkVolume_) return false;
-    VolumeType::PointType pt;
-    pt[0] = world[0]; pt[1] = world[1]; pt[2] = world[2];
-    return itkVolume_->TransformPhysicalPointToIndex(pt, idx);
+    if (itkVolume_) {
+        VolumeType::PointType pt;
+        pt[0] = world[0]; pt[1] = world[1]; pt[2] = world[2];
+        return itkVolume_->TransformPhysicalPointToIndex(pt, idx);
+    }
+    if (dimX_ > 0 && spacing_[0] > 0 && spacing_[1] > 0 && spacing_[2] > 0) {
+        long long ix = std::lround((world[0] - origin_[0]) / spacing_[0]);
+        long long iy = std::lround((world[1] - origin_[1]) / spacing_[1]);
+        long long iz = std::lround((world[2] - origin_[2]) / spacing_[2]);
+        if (ix < 0 || ix >= dimX_ || iy < 0 || iy >= dimY_ || iz < 0 || iz >= dimZ_) return false;
+        idx[0] = ix; idx[1] = iy; idx[2] = iz;
+        return true;
+    }
+    return false;
 }
 
 void OrthoSliceView::handleVoxelClicked(const double worldPos[3]) {
