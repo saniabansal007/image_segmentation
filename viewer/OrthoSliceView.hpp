@@ -18,7 +18,7 @@
 #include <vtkImageProperty.h>
 #include <vtkLookupTable.h>
 #include <vtkExtractVOI.h>
-#include <vtkMarchingSquares.h>
+#include <vtkContourFilter.h>
 #include <vtkPolyDataMapper.h>
 #include <vtkActor.h>
 #include <vtkProperty.h>
@@ -154,9 +154,9 @@ private:
     vtkSmartPointer<vtkImageActor> maskFillActor_;
     vtkSmartPointer<vtkLookupTable> maskLut_;
 
-    // High-contrast ROI boundary contour (derived via Marching Squares on 2D slice)
+    // High-contrast ROI boundary contour (derived via vtkContourFilter on 2D slice)
     vtkSmartPointer<vtkExtractVOI> extractVOI_;
-    vtkSmartPointer<vtkMarchingSquares> marchingSquares_;
+    vtkSmartPointer<vtkContourFilter> contourFilter_;
     vtkSmartPointer<vtkPolyDataMapper> contourMapper_;
     vtkSmartPointer<vtkActor> contourActor_;
 

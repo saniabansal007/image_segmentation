@@ -182,21 +182,24 @@ void OrthoSliceView::setupVTKPipeline() {
 
     maskFillActor_->GetProperty()->SetLookupTable(maskLut_);
     maskFillActor_->GetProperty()->UseLookupTableScalarRangeOn();
-    maskFillActor_->GetProperty()->SetOpacity(fillOpacity_);
+    maskFillActor_->GetProperty()->SetInterpolationTypeToNearest();
+    maskFillActor_->GetProperty()->SetOpacity(1.0);
+    maskFillActor_->SetVisibility(false);
     renderer_->AddActor(maskFillActor_);
 
-    // High-contrast ROI boundary contour actor (Marching Squares pipeline)
+    // High-contrast ROI boundary contour actor (vtkContourFilter pipeline for 2D slices in all planes)
     extractVOI_ = vtkSmartPointer<vtkExtractVOI>::New();
-    marchingSquares_ = vtkSmartPointer<vtkMarchingSquares>::New();
-    marchingSquares_->SetInputConnection(extractVOI_->GetOutputPort());
-    marchingSquares_->SetValue(0, 0.5); // iso-contour separating label 0 and label 1
+    contourFilter_ = vtkSmartPointer<vtkContourFilter>::New();
+    contourFilter_->SetInputConnection(extractVOI_->GetOutputPort());
+    contourFilter_->SetValue(0, 0.5); // iso-contour separating label 0 and label 1
 
     contourMapper_ = vtkSmartPointer<vtkPolyDataMapper>::New();
-    contourMapper_->SetInputConnection(marchingSquares_->GetOutputPort());
+    contourMapper_->SetInputConnection(contourFilter_->GetOutputPort());
     contourMapper_->ScalarVisibilityOff();
     // Resolve coincident topology to ensure contour lines sit crisp on top of image
     contourMapper_->SetResolveCoincidentTopologyToPolygonOffset();
-    contourMapper_->SetResolveCoincidentTopologyPolygonOffsetParameters(2.0, 2.0);
+    contourMapper_->SetRelativeCoincidentTopologyLineOffsetParameters(-4.0, -4.0);
+    contourMapper_->SetRelativeCoincidentTopologyPolygonOffsetParameters(-2.0, -2.0);
 
     contourActor_ = vtkSmartPointer<vtkActor>::New();
     contourActor_->SetMapper(contourMapper_);
@@ -347,6 +350,14 @@ void OrthoSliceView::setSliceData2D(const uint16_t* data, int width, int height,
     grayData_->Modified();
     grayMapper_->SetSliceNumber(currentSliceIndex_);
     maskFillMapper_->SetSliceNumber(currentSliceIndex_);
+    if (maskData_) {
+        int ext[6];
+        maskData_->GetExtent(ext);
+        bool inBounds = (orientation_ == 2 && currentSliceIndex_ >= ext[4] && currentSliceIndex_ <= ext[5]) ||
+                        (orientation_ == 1 && currentSliceIndex_ >= ext[2] && currentSliceIndex_ <= ext[3]) ||
+                        (orientation_ == 0 && currentSliceIndex_ >= ext[0] && currentSliceIndex_ <= ext[1]);
+        maskFillActor_->SetVisibility(fillVisible_ && inBounds);
+    }
 
     sliceSlider_->blockSignals(true);
     sliceSpinBox_->blockSignals(true);
@@ -400,7 +411,16 @@ void OrthoSliceView::setMaskData(vtkImageData* maskData, LabelVolumeType::Pointe
     extractVOI_->SetInputData(maskData_);
 
     if (maskData_) {
-        maskFillMapper_->SetSliceNumber(currentSlice());
+        int s = currentSlice();
+        maskFillMapper_->SetSliceNumber(s);
+        int ext[6];
+        maskData_->GetExtent(ext);
+        bool inBounds = (orientation_ == 2 && s >= ext[4] && s <= ext[5]) ||
+                        (orientation_ == 1 && s >= ext[2] && s <= ext[3]) ||
+                        (orientation_ == 0 && s >= ext[0] && s <= ext[1]);
+        maskFillActor_->SetVisibility(fillVisible_ && inBounds);
+    } else {
+        maskFillActor_->SetVisibility(false);
     }
 
     updateContour();
@@ -426,12 +446,28 @@ void OrthoSliceView::setSlice(int sliceIndex) {
     if (!isLazyMode_) {
         grayMapper_->SetSliceNumber(s);
         maskFillMapper_->SetSliceNumber(s);
+        if (maskData_) {
+            int ext[6];
+            maskData_->GetExtent(ext);
+            bool inBounds = (orientation_ == 2 && s >= ext[4] && s <= ext[5]) ||
+                            (orientation_ == 1 && s >= ext[2] && s <= ext[3]) ||
+                            (orientation_ == 0 && s >= ext[0] && s <= ext[1]);
+            maskFillActor_->SetVisibility(fillVisible_ && inBounds);
+        }
         updateBadgeText();
         updateCrosshairs();
         updateContour();
         render();
     } else {
         maskFillMapper_->SetSliceNumber(s);
+        if (maskData_) {
+            int ext[6];
+            maskData_->GetExtent(ext);
+            bool inBounds = (orientation_ == 2 && s >= ext[4] && s <= ext[5]) ||
+                            (orientation_ == 1 && s >= ext[2] && s <= ext[3]) ||
+                            (orientation_ == 0 && s >= ext[0] && s <= ext[1]);
+            maskFillActor_->SetVisibility(fillVisible_ && inBounds);
+        }
         updateBadgeText();
         updateCrosshairs();
         updateContour();
@@ -498,13 +534,12 @@ void OrthoSliceView::setBoundaryLineWidth(float width) {
 
 void OrthoSliceView::setFillVisible(bool visible) {
     fillVisible_ = visible;
-    maskFillActor_->SetVisibility(visible);
+    maskFillActor_->SetVisibility(visible && (maskData_ != nullptr));
     render();
 }
 
 void OrthoSliceView::setFillOpacity(double opacity) {
     fillOpacity_ = opacity;
-    maskFillActor_->GetProperty()->SetOpacity(opacity);
     maskLut_->SetTableValue(1, fillColor_[0], fillColor_[1], fillColor_[2], opacity);
     maskLut_->Build();
     render();
@@ -546,6 +581,23 @@ void OrthoSliceView::updateContour() {
     int extent[6];
     maskData_->GetExtent(extent);
 
+    if (orientation_ == 2) {
+        if (s < extent[4] || s > extent[5]) {
+            contourActor_->SetVisibility(false);
+            return;
+        }
+    } else if (orientation_ == 1) {
+        if (s < extent[2] || s > extent[3]) {
+            contourActor_->SetVisibility(false);
+            return;
+        }
+    } else {
+        if (s < extent[0] || s > extent[1]) {
+            contourActor_->SetVisibility(false);
+            return;
+        }
+    }
+
     int voi[6] = {extent[0], extent[1], extent[2], extent[3], extent[4], extent[5]};
     if (orientation_ == 2) {
         voi[4] = s; voi[5] = s;
@@ -557,9 +609,9 @@ void OrthoSliceView::updateContour() {
 
     extractVOI_->SetVOI(voi);
     extractVOI_->Update();
-    marchingSquares_->Update();
+    contourFilter_->Update();
 
-    bool hasLines = (marchingSquares_->GetOutput() && marchingSquares_->GetOutput()->GetNumberOfLines() > 0);
+    bool hasLines = (contourFilter_->GetOutput() && contourFilter_->GetOutput()->GetNumberOfLines() > 0);
     contourActor_->SetVisibility(boundaryVisible_ && hasLines);
 }
 

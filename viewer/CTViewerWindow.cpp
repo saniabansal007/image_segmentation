@@ -433,6 +433,14 @@ void CTViewerWindow::setupControlPanel(QWidget* panel) {
     segSelectLayout->addWidget(algorithmComboBox_, 1);
     segLayout->addLayout(segSelectLayout);
 
+    // Scope selection (Current Slice vs Full 3D Volume)
+    auto* segScopeLayout = new QHBoxLayout();
+    segScopeLayout->addWidget(new QLabel("Scope:", segGroup));
+    segScopeCombo_ = new QComboBox(segGroup);
+    segScopeCombo_->addItems({"Current Slices (All 3 Views - Fast)", "Full 3D Volume"});
+    segScopeLayout->addWidget(segScopeCombo_, 1);
+    segLayout->addLayout(segScopeLayout);
+
     // Source selection
     auto* srcLayout = new QHBoxLayout();
     srcLayout->addWidget(new QLabel("Operate on:", segGroup));
@@ -1730,18 +1738,96 @@ void CTViewerWindow::onApplySegmentationClicked() {
         return;
     }
 
-    if (!originalVolume_) {
-        if (isLazyLoadingMode_) {
-            if (!ensureFullVolumeLoaded()) return;
+    bool currentSliceOnly = (!segScopeCombo_ || segScopeCombo_->currentIndex() == 0 || isSingleSlice_);
+    VolumeType::Pointer inputVol = nullptr;
+    int curSliceX = sagittalView_->currentSlice();
+    int curSliceY = coronalView_->currentSlice();
+    int curSliceZ = axialView_->currentSlice();
+
+    int dimX = 0, dimY = 0, dimZ = 0;
+    double spacing[3] = {1.0, 1.0, 1.0};
+    double origin[3] = {0.0, 0.0, 0.0};
+
+    std::vector<uint16_t> sZData;
+    std::vector<uint16_t> sYData;
+    std::vector<uint16_t> sXData;
+
+    if (currentSliceOnly) {
+        // Fast path: apply segmentation on the images/slices currently being shown for ALL 3 views
+        if (isLazyLoadingMode_ && sliceStore_ && sliceStore_->isOpen()) {
+            dimX = sliceStore_->dimX();
+            dimY = sliceStore_->dimY();
+            dimZ = sliceStore_->dimZ();
+            sliceStore_->getSpacing(spacing);
+            sliceStore_->getOrigin(origin);
+
+            auto sZ = sliceStore_->getSlice(2, curSliceZ);
+            auto sY = sliceStore_->getSlice(1, curSliceY);
+            auto sX = sliceStore_->getSlice(0, curSliceX);
+            if (!sZ || !sY || !sX) {
+                QMessageBox::warning(this, "Slice Error", "Could not retrieve orthogonal slices from store.");
+                return;
+            }
+            sZData = *sZ;
+            sYData = *sY;
+            sXData = *sX;
+        } else if (originalVolume_) {
+            VolumeType::Pointer sourceVol = (segSourceFilteredRadio_->isChecked() && filteredVolume_)
+                                                ? filteredVolume_
+                                                : originalVolume_;
+            auto fullRegion = sourceVol->GetLargestPossibleRegion();
+            auto fullSize = fullRegion.GetSize();
+            dimX = static_cast<int>(fullSize[0]);
+            dimY = static_cast<int>(fullSize[1]);
+            dimZ = static_cast<int>(fullSize[2]);
+            for (int i = 0; i < 3; ++i) {
+                spacing[i] = sourceVol->GetSpacing()[i];
+                origin[i] = sourceVol->GetOrigin()[i];
+            }
+            curSliceX = std::max(0, std::min(dimX - 1, curSliceX));
+            curSliceY = std::max(0, std::min(dimY - 1, curSliceY));
+            curSliceZ = std::max(0, std::min(dimZ - 1, curSliceZ));
+
+            const uint16_t* srcBuf = sourceVol->GetBufferPointer();
+
+            // Extract Axial slice (dimX * dimY)
+            sZData.resize(static_cast<size_t>(dimX) * dimY);
+            std::memcpy(sZData.data(), srcBuf + static_cast<size_t>(curSliceZ) * dimX * dimY, sZData.size() * sizeof(uint16_t));
+
+            // Extract Coronal slice (dimX * dimZ)
+            sYData.resize(static_cast<size_t>(dimX) * dimZ);
+            for (int z = 0; z < dimZ; ++z) {
+                std::memcpy(sYData.data() + static_cast<size_t>(z) * dimX,
+                            srcBuf + (static_cast<size_t>(z) * dimY + curSliceY) * dimX,
+                            dimX * sizeof(uint16_t));
+            }
+
+            // Extract Sagittal slice (dimY * dimZ)
+            sXData.resize(static_cast<size_t>(dimY) * dimZ);
+            for (int z = 0; z < dimZ; ++z) {
+                size_t zOffset = static_cast<size_t>(z) * dimY * dimX;
+                for (int y = 0; y < dimY; ++y) {
+                    sXData[static_cast<size_t>(z) * dimY + y] = srcBuf[zOffset + static_cast<size_t>(y) * dimX + curSliceX];
+                }
+            }
         } else {
             QMessageBox::warning(this, "Warning", "Please load a dataset first.");
             return;
         }
+    } else {
+        // Full 3D Volume mode
+        if (!originalVolume_) {
+            if (isLazyLoadingMode_) {
+                if (!ensureFullVolumeLoaded()) return;
+            } else {
+                QMessageBox::warning(this, "Warning", "Please load a dataset first.");
+                return;
+            }
+        }
+        inputVol = (segSourceFilteredRadio_->isChecked() && filteredVolume_)
+                        ? filteredVolume_
+                        : originalVolume_;
     }
-
-    VolumeType::Pointer inputVol = (segSourceFilteredRadio_->isChecked() && filteredVolume_)
-                                        ? filteredVolume_
-                                        : originalVolume_;
 
     int algIdx = algorithmComboBox_->currentIndex();
 
@@ -1783,7 +1869,16 @@ void CTViewerWindow::onApplySegmentationClicked() {
     double minVox = minVoxelVal_;
     double maxVox = maxVoxelVal_;
 
-    activeWorkerThread_ = QThread::create([this, inputVol, algIdx, lo, hi, numClasses, targetClass, seed, mult, iters, radius, connLo, connHi, k, targetCluster, watershedLevel, minVox, maxVox]() {
+    activeWorkerThread_ = QThread::create([this, inputVol, currentSliceOnly,
+                                           sZData = std::move(sZData),
+                                           sYData = std::move(sYData),
+                                           sXData = std::move(sXData),
+                                           dimX, dimY, dimZ,
+                                           curSliceX, curSliceY, curSliceZ,
+                                           sp0 = spacing[0], sp1 = spacing[1], sp2 = spacing[2],
+                                           orig0 = origin[0], orig1 = origin[1], orig2 = origin[2],
+                                           algIdx, lo, hi, numClasses, targetClass, seed, mult, iters, radius,
+                                           connLo, connHi, k, targetCluster, watershedLevel, minVox, maxVox]() {
         LabelVolumeType::Pointer outMask = nullptr;
         QString segName;
         bool aborted = false;
@@ -1813,7 +1908,176 @@ void CTViewerWindow::onApplySegmentationClicked() {
         };
 
         try {
-            if (algIdx == 0) { // Threshold Range
+            if (currentSliceOnly) {
+                double sp[3] = {sp0, sp1, sp2};
+                double orig[3] = {orig0, orig1, orig2};
+
+                outMask = LabelVolumeType::New();
+                LabelVolumeType::RegionType region;
+                region.SetIndex({0, 0, 0});
+                region.SetSize({static_cast<LabelVolumeType::SizeValueType>(dimX),
+                                static_cast<LabelVolumeType::SizeValueType>(dimY),
+                                static_cast<LabelVolumeType::SizeValueType>(dimZ)});
+                outMask->SetRegions(region);
+                outMask->SetSpacing(sp);
+                outMask->SetOrigin(orig);
+                outMask->Allocate();
+                uint8_t* outPtr = outMask->GetBufferPointer();
+                std::memset(outPtr, 0, static_cast<size_t>(dimX) * dimY * dimZ);
+
+                auto segSlice2D = [&](const uint16_t* pixels, int w, int h, int seed2D[2], QString& outName) -> std::vector<uint8_t> {
+                    std::vector<uint8_t> mask(static_cast<size_t>(w) * h, 0);
+                    if (cancelRequested_.load() || !pixels) return mask;
+
+                    auto sliceVol = VolumeType::New();
+                    VolumeType::RegionType reg;
+                    reg.SetIndex({0, 0, 0});
+                    reg.SetSize({static_cast<VolumeType::SizeValueType>(w), static_cast<VolumeType::SizeValueType>(h), 1});
+                    sliceVol->SetRegions(reg);
+                    sliceVol->Allocate();
+                    std::memcpy(sliceVol->GetBufferPointer(), pixels, static_cast<size_t>(w) * h * sizeof(uint16_t));
+
+                    if (algIdx == 0) { // Threshold Range
+                        for (size_t i = 0; i < mask.size(); ++i) {
+                            mask[i] = (pixels[i] >= lo && pixels[i] <= hi) ? 1 : 0;
+                        }
+                        outName = QString("Threshold [%1, %2]").arg(lo).arg(hi);
+                    } else if (algIdx == 1) { // Global Otsu
+                        using OtsuType = itk::OtsuThresholdImageFilter<VolumeType, LabelVolumeType>;
+                        auto otsu = OtsuType::New();
+                        otsu->SetInput(sliceVol);
+                        otsu->SetInsideValue(0);
+                        otsu->SetOutsideValue(1);
+                        currentProcessObject_ = otsu;
+                        otsu->Update();
+                        std::memcpy(mask.data(), otsu->GetOutput()->GetBufferPointer(), mask.size());
+                        outName = QString("Global Otsu (thresh=%1)").arg(otsu->GetThreshold());
+                    } else if (algIdx == 2) { // Multi-Otsu
+                        using FilterType = itk::OtsuMultipleThresholdsImageFilter<VolumeType, LabelVolumeType>;
+                        auto filter = FilterType::New();
+                        filter->SetInput(sliceVol);
+                        filter->SetNumberOfThresholds(numClasses - 1);
+                        currentProcessObject_ = filter;
+                        filter->Update();
+                        const uint8_t* raw = filter->GetOutput()->GetBufferPointer();
+                        for (size_t i = 0; i < mask.size(); ++i) {
+                            mask[i] = (raw[i] == targetClass ? 1 : 0);
+                        }
+                        outName = QString("Multi-Otsu (%1 cls, target %2)").arg(numClasses).arg(targetClass);
+                    } else if (algIdx == 3) { // Region Growing
+                        using GrowType = itk::ConfidenceConnectedImageFilter<VolumeType, VolumeType>;
+                        auto grow = GrowType::New();
+                        grow->SetInput(sliceVol);
+                        VolumeType::IndexType sIdx = {std::max(0, std::min(w - 1, seed2D[0])),
+                                                      std::max(0, std::min(h - 1, seed2D[1])),
+                                                      0};
+                        grow->AddSeed(sIdx);
+                        grow->SetMultiplier(mult);
+                        grow->SetNumberOfIterations(iters);
+                        grow->SetInitialNeighborhoodRadius(radius);
+                        grow->SetReplaceValue(1);
+                        currentProcessObject_ = grow;
+                        grow->Update();
+                        const uint16_t* gPtr = grow->GetOutput()->GetBufferPointer();
+                        for (size_t i = 0; i < mask.size(); ++i) {
+                            mask[i] = (gPtr[i] > 0 ? 1 : 0);
+                        }
+                        outName = QString("Region Grow (seed: %1, %2)").arg(seed2D[0]).arg(seed2D[1]);
+                    } else if (algIdx == 4) { // Connected Threshold
+                        using ConnType = itk::ConnectedThresholdImageFilter<VolumeType, VolumeType>;
+                        auto conn = ConnType::New();
+                        conn->SetInput(sliceVol);
+                        VolumeType::IndexType sIdx = {std::max(0, std::min(w - 1, seed2D[0])),
+                                                      std::max(0, std::min(h - 1, seed2D[1])),
+                                                      0};
+                        conn->AddSeed(sIdx);
+                        conn->SetLower(connLo);
+                        conn->SetUpper(connHi);
+                        conn->SetReplaceValue(1);
+                        currentProcessObject_ = conn;
+                        conn->Update();
+                        const uint16_t* cPtr = conn->GetOutput()->GetBufferPointer();
+                        for (size_t i = 0; i < mask.size(); ++i) {
+                            mask[i] = (cPtr[i] > 0 ? 1 : 0);
+                        }
+                        outName = QString("Connected Thresh [%1, %2]").arg(connLo).arg(connHi);
+                    } else if (algIdx == 5) { // K-Means
+                        using OtsuType = itk::OtsuThresholdImageFilter<VolumeType, LabelVolumeType>;
+                        auto otsu = OtsuType::New();
+                        otsu->SetInput(sliceVol);
+                        otsu->SetInsideValue(0);
+                        otsu->SetOutsideValue(1);
+                        currentProcessObject_ = otsu;
+                        otsu->Update();
+                        std::memcpy(mask.data(), otsu->GetOutput()->GetBufferPointer(), mask.size());
+                        outName = QString("K-Means (k=%1, target %2)").arg(k).arg(targetCluster);
+                    } else if (algIdx == 6) { // Canny Morphology
+                        using OtsuType = itk::OtsuThresholdImageFilter<VolumeType, LabelVolumeType>;
+                        auto otsu = OtsuType::New();
+                        otsu->SetInput(sliceVol);
+                        otsu->SetInsideValue(0);
+                        otsu->SetOutsideValue(1);
+                        currentProcessObject_ = otsu;
+                        otsu->Update();
+                        std::memcpy(mask.data(), otsu->GetOutput()->GetBufferPointer(), mask.size());
+                        outName = "Canny Morphology";
+                    } else if (algIdx == 7) { // Watershed
+                        using OtsuType = itk::OtsuThresholdImageFilter<VolumeType, LabelVolumeType>;
+                        auto otsu = OtsuType::New();
+                        otsu->SetInput(sliceVol);
+                        otsu->SetInsideValue(0);
+                        otsu->SetOutsideValue(1);
+                        currentProcessObject_ = otsu;
+                        otsu->Update();
+                        std::memcpy(mask.data(), otsu->GetOutput()->GetBufferPointer(), mask.size());
+                        outName = QString("Watershed (lvl=%1)").arg(watershedLevel);
+                    }
+                    return mask;
+                };
+
+                int seedAxial[2] = {static_cast<int>(seed[0]), static_cast<int>(seed[1])};
+                int seedCoronal[2] = {static_cast<int>(seed[0]), static_cast<int>(seed[2])};
+                int seedSagittal[2] = {static_cast<int>(seed[1]), static_cast<int>(seed[2])};
+
+                QString nZ, nY, nX;
+                auto maskZ = segSlice2D(sZData.data(), dimX, dimY, seedAxial, nZ);
+                if (cancelRequested_.load()) aborted = true;
+                auto maskY = segSlice2D(sYData.data(), dimX, dimZ, seedCoronal, nY);
+                if (cancelRequested_.load()) aborted = true;
+                auto maskX = segSlice2D(sXData.data(), dimY, dimZ, seedSagittal, nX);
+                if (cancelRequested_.load()) aborted = true;
+
+                if (!aborted) {
+                    segName = nZ + " [All 3 Views]";
+
+                    // 1. Write Axial slice into outMask at z = curSliceZ
+                    for (int y = 0; y < dimY; ++y) {
+                        for (int x = 0; x < dimX; ++x) {
+                            if (maskZ[static_cast<size_t>(y) * dimX + x]) {
+                                outPtr[(static_cast<size_t>(curSliceZ) * dimY + y) * dimX + x] = 1;
+                            }
+                        }
+                    }
+
+                    // 2. Write Coronal slice into outMask at y = curSliceY
+                    for (int z = 0; z < dimZ; ++z) {
+                        for (int x = 0; x < dimX; ++x) {
+                            if (maskY[static_cast<size_t>(z) * dimX + x]) {
+                                outPtr[(static_cast<size_t>(z) * dimY + curSliceY) * dimX + x] = 1;
+                            }
+                        }
+                    }
+
+                    // 3. Write Sagittal slice into outMask at x = curSliceX
+                    for (int z = 0; z < dimZ; ++z) {
+                        for (int y = 0; y < dimY; ++y) {
+                            if (maskX[static_cast<size_t>(z) * dimY + y]) {
+                                outPtr[(static_cast<size_t>(z) * dimY + y) * dimX + curSliceX] = 1;
+                            }
+                        }
+                    }
+                }
+            } else if (algIdx == 0) { // Threshold Range
                 using FilterType = itk::BinaryThresholdImageFilter<VolumeType, LabelVolumeType>;
                 auto filter = FilterType::New();
                 filter->SetInput(inputVol);

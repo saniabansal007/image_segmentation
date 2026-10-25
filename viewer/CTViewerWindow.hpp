@@ -168,6 +168,7 @@ private:
     QCheckBox* compareFilterCheck_ = nullptr;
 
     // GUI Controls - Segmentation
+    QComboBox* segScopeCombo_ = nullptr;
     QComboBox* algorithmComboBox_ = nullptr;
     QStackedWidget* algorithmParamsStack_ = nullptr;
     QRadioButton* segSourceFilteredRadio_ = nullptr;
