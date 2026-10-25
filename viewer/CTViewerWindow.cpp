@@ -1989,14 +1989,16 @@ void CTViewerWindow::onFilterCompleted(VolumeType::Pointer outVol, const QString
 }
 
 void CTViewerWindow::onResetFilterClicked() {
+    bool hadFilteredSlices = hasFilteredSlices_;
+    int curZ = axialView_->currentSlice();
+    int curY = coronalView_->currentSlice();
+    int curX = sagittalView_->currentSlice();
+
     filteredVolume_ = nullptr;
     hasFilteredSlices_ = false;
     currentFilteredZ_.clear();
     currentFilteredY_.clear();
     currentFilteredX_.clear();
-    currentOriginalZ_.clear();
-    currentOriginalY_.clear();
-    currentOriginalX_.clear();
     filteredSliceZ_ = -1;
     filteredSliceY_ = -1;
     filteredSliceX_ = -1;
@@ -2012,19 +2014,57 @@ void CTViewerWindow::onResetFilterClicked() {
 
     segSourceOriginalRadio_->setChecked(true);
 
-    if (originalVolume_) {
+    if (hadFilteredSlices) {
+        // Restore original raw slice pixels directly to the active 2D views
+        if (!currentOriginalZ_.empty()) {
+            axialView_->setSliceData2D(currentOriginalZ_.data(), dimX_, dimY_, curZ);
+        } else if (isLazyLoadingMode_ && sliceStore_) {
+            auto sZ = sliceStore_->getSlice(2, curZ);
+            if (sZ) axialView_->setSliceData2D(sZ->data(), sliceStore_->manifest().dimX, sliceStore_->manifest().dimY, curZ);
+        }
+
+        if (!isSingleSlice_) {
+            if (!currentOriginalY_.empty()) {
+                coronalView_->setSliceData2D(currentOriginalY_.data(), dimX_, dimZ_, curY);
+            } else if (isLazyLoadingMode_ && sliceStore_) {
+                auto sY = sliceStore_->getSlice(1, curY);
+                if (sY) coronalView_->setSliceData2D(sY->data(), sliceStore_->manifest().dimX, sliceStore_->manifest().dimZ, curY);
+            }
+
+            if (!currentOriginalX_.empty()) {
+                sagittalView_->setSliceData2D(currentOriginalX_.data(), dimY_, dimZ_, curX);
+            } else if (isLazyLoadingMode_ && sliceStore_) {
+                auto sX = sliceStore_->getSlice(0, curX);
+                if (sX) sagittalView_->setSliceData2D(sX->data(), sliceStore_->manifest().dimY, sliceStore_->manifest().dimZ, curX);
+            }
+        }
+
+        currentOriginalZ_.clear();
+        currentOriginalY_.clear();
+        currentOriginalX_.clear();
+
+        axialView_->setCrosshairPosition(currentCursor_[0], currentCursor_[1], currentCursor_[2]);
+        coronalView_->setCrosshairPosition(currentCursor_[0], currentCursor_[1], currentCursor_[2]);
+        sagittalView_->setCrosshairPosition(currentCursor_[0], currentCursor_[1], currentCursor_[2]);
+
+    } else if (isLazyLoadingMode_ && sliceStore_) {
+        // Refresh slices from sliceStore without reinitializing geometry or resetting camera/sliders
+        auto sZ = sliceStore_->getSlice(2, curZ);
+        if (sZ) axialView_->setSliceData2D(sZ->data(), sliceStore_->manifest().dimX, sliceStore_->manifest().dimY, curZ);
+        if (!isSingleSlice_) {
+            auto sY = sliceStore_->getSlice(1, curY);
+            if (sY) coronalView_->setSliceData2D(sY->data(), sliceStore_->manifest().dimX, sliceStore_->manifest().dimZ, curY);
+            auto sX = sliceStore_->getSlice(0, curX);
+            if (sX) sagittalView_->setSliceData2D(sX->data(), sliceStore_->manifest().dimY, sliceStore_->manifest().dimZ, curX);
+        }
+        axialView_->setCrosshairPosition(currentCursor_[0], currentCursor_[1], currentCursor_[2]);
+        coronalView_->setCrosshairPosition(currentCursor_[0], currentCursor_[1], currentCursor_[2]);
+        sagittalView_->setCrosshairPosition(currentCursor_[0], currentCursor_[1], currentCursor_[2]);
+
+    } else if (originalVolume_) {
+        // Full 3D volume mode: restore original volume
         displayVolume_ = originalVolume_;
         updateVolumeDisplay();
-    } else if (isLazyLoadingMode_ && sliceStore_) {
-        grayVTKData_ = nullptr;
-        volumeToVTK_ = nullptr;
-        displayVolume_ = nullptr;
-        double sp[3] = {sliceStore_->manifest().spacingX, sliceStore_->manifest().spacingY, sliceStore_->manifest().spacingZ};
-        double orig[3] = {sliceStore_->manifest().originX, sliceStore_->manifest().originY, sliceStore_->manifest().originZ};
-        axialView_->initGeometry(sliceStore_->manifest().dimX, sliceStore_->manifest().dimY, sliceStore_->manifest().dimZ, sp, orig);
-        coronalView_->initGeometry(sliceStore_->manifest().dimX, sliceStore_->manifest().dimY, sliceStore_->manifest().dimZ, sp, orig);
-        sagittalView_->initGeometry(sliceStore_->manifest().dimX, sliceStore_->manifest().dimY, sliceStore_->manifest().dimZ, sp, orig);
-        requestSlicesForCursor(currentCursor_[0], currentCursor_[1], currentCursor_[2]);
     }
 
     statusFilterLabel_->setText("Filter: None (Original)");
