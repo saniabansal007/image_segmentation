@@ -102,7 +102,8 @@ private slots:
     void onExportMaskedCTClicked();
 
     // Process Execution Completion Slots
-    void onFilterCompleted(VolumeType::Pointer outVol, const QString& filterName, bool aborted, const QString& errMsg, qint64 elapsedMs);
+    void onFilterCompleted(VolumeType::Pointer outVol, const QString& filterName, bool aborted, const QString& errMsg, qint64 elapsedMs,
+                           std::vector<uint16_t> filtZ = {}, std::vector<uint16_t> filtY = {}, std::vector<uint16_t> filtX = {});
     void onSegmentationCompleted(LabelVolumeType::Pointer outMask, const QString& segName, bool aborted, const QString& errMsg, long fgCount, qint64 elapsedMs);
 
 private:
@@ -156,6 +157,7 @@ private:
 
     // GUI Controls - Preprocessing
     QComboBox* filterComboBox_ = nullptr;
+    QComboBox* filterScopeCombo_ = nullptr;
     QStackedWidget* filterParamsStack_ = nullptr;
     QDoubleSpinBox* gaussianSigmaSpin_ = nullptr;
     QSpinBox* medianRadiusSpin_ = nullptr;
@@ -231,6 +233,19 @@ private:
     double autoLevel_ = 500.0;
     double minVoxelVal_ = 0.0;
     double maxVoxelVal_ = 65535.0;
+
+    // Filtered slices state (fast slice mode)
+    bool hasFilteredSlices_ = false;
+    int filteredSliceZ_ = -1;
+    int filteredSliceY_ = -1;
+    int filteredSliceX_ = -1;
+    std::vector<uint16_t> currentFilteredZ_;
+    std::vector<uint16_t> currentFilteredY_;
+    std::vector<uint16_t> currentFilteredX_;
+    std::vector<uint16_t> currentOriginalZ_;
+    std::vector<uint16_t> currentOriginalY_;
+    std::vector<uint16_t> currentOriginalX_;
+    int dimX_ = 512, dimY_ = 512, dimZ_ = 1;
 
     // Lazy slice loading
     std::shared_ptr<SliceStore> sliceStore_;

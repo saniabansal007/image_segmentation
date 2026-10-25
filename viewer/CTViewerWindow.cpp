@@ -330,6 +330,14 @@ void CTViewerWindow::setupControlPanel(QWidget* panel) {
     filterSelectLayout->addWidget(filterComboBox_, 1);
     filterLayout->addLayout(filterSelectLayout);
 
+    // Scope selection (Current Slices vs Full 3D Volume)
+    auto* filterScopeLayout = new QHBoxLayout();
+    filterScopeLayout->addWidget(new QLabel("Scope:", filterGroup));
+    filterScopeCombo_ = new QComboBox(filterGroup);
+    filterScopeCombo_->addItems({"Current Slices (All 3 Views - Fast)", "Full 3D Volume"});
+    filterScopeLayout->addWidget(filterScopeCombo_, 1);
+    filterLayout->addLayout(filterScopeLayout);
+
     // Filter Parameter Stack
     filterParamsStack_ = new QStackedWidget(filterGroup);
 
@@ -885,6 +893,9 @@ bool CTViewerWindow::loadVolumeFromDirectory(const std::string& dirPath, size_t 
         threshLowerSpin_->setValue(static_cast<int>(autoLevel_));
         threshUpperSpin_->setValue(static_cast<int>(maxVoxelVal_));
 
+        dimX_ = static_cast<int>(size[0]);
+        dimY_ = static_cast<int>(size[1]);
+        dimZ_ = static_cast<int>(size[2]);
         updateVolumeDisplay();
 
         statusPerfLabel_->setText(QString("Volume loaded in %1 ms (%2 slices)").arg(timer.elapsed()).arg(size[2]));
@@ -964,6 +975,10 @@ bool CTViewerWindow::loadPreprocessedDataset(const std::string& preprocessedDir)
         double sp[3] = {manifest.spacingX, manifest.spacingY, manifest.spacingZ};
         double orig[3] = {manifest.originX, manifest.originY, manifest.originZ};
 
+        dimX_ = manifest.dimX;
+        dimY_ = manifest.dimY;
+        dimZ_ = manifest.dimZ;
+
         axialView_->initGeometry(manifest.dimX, manifest.dimY, manifest.dimZ, sp, orig);
         coronalView_->initGeometry(manifest.dimX, manifest.dimY, manifest.dimZ, sp, orig);
         sagittalView_->initGeometry(manifest.dimX, manifest.dimY, manifest.dimZ, sp, orig);
@@ -999,23 +1014,36 @@ void CTViewerWindow::requestSlicesForCursor(int x, int y, int z) {
     if (!sliceStore_ || !isLazyLoadingMode_) return;
 
     uint64_t seq = ++sliceRequestSeq_;
+    bool showFiltered = hasFilteredSlices_ && (!compareFilterCheck_ || !compareFilterCheck_->isChecked());
 
     // Axial slice: plane Z = z (orientation 2)
-    auto axSlice = sliceStore_->getSlice(2, z);
-    if (axSlice && seq == sliceRequestSeq_) {
-        axialView_->setSliceData2D(axSlice->data(), sliceStore_->manifest().dimX, sliceStore_->manifest().dimY, z);
+    if (showFiltered && z == filteredSliceZ_ && !currentFilteredZ_.empty()) {
+        axialView_->setSliceData2D(currentFilteredZ_.data(), sliceStore_->manifest().dimX, sliceStore_->manifest().dimY, z);
+    } else {
+        auto axSlice = sliceStore_->getSlice(2, z);
+        if (axSlice && seq == sliceRequestSeq_) {
+            axialView_->setSliceData2D(axSlice->data(), sliceStore_->manifest().dimX, sliceStore_->manifest().dimY, z);
+        }
     }
 
     // Coronal slice: plane Y = y (orientation 1)
-    auto corSlice = sliceStore_->getSlice(1, y);
-    if (corSlice && seq == sliceRequestSeq_) {
-        coronalView_->setSliceData2D(corSlice->data(), sliceStore_->manifest().dimX, sliceStore_->manifest().dimZ, y);
+    if (showFiltered && y == filteredSliceY_ && !currentFilteredY_.empty()) {
+        coronalView_->setSliceData2D(currentFilteredY_.data(), sliceStore_->manifest().dimX, sliceStore_->manifest().dimZ, y);
+    } else {
+        auto corSlice = sliceStore_->getSlice(1, y);
+        if (corSlice && seq == sliceRequestSeq_) {
+            coronalView_->setSliceData2D(corSlice->data(), sliceStore_->manifest().dimX, sliceStore_->manifest().dimZ, y);
+        }
     }
 
     // Sagittal slice: plane X = x (orientation 0)
-    auto sagSlice = sliceStore_->getSlice(0, x);
-    if (sagSlice && seq == sliceRequestSeq_) {
-        sagittalView_->setSliceData2D(sagSlice->data(), sliceStore_->manifest().dimY, sliceStore_->manifest().dimZ, x);
+    if (showFiltered && x == filteredSliceX_ && !currentFilteredX_.empty()) {
+        sagittalView_->setSliceData2D(currentFilteredX_.data(), sliceStore_->manifest().dimY, sliceStore_->manifest().dimZ, x);
+    } else {
+        auto sagSlice = sliceStore_->getSlice(0, x);
+        if (sagSlice && seq == sliceRequestSeq_) {
+            sagittalView_->setSliceData2D(sagSlice->data(), sliceStore_->manifest().dimY, sliceStore_->manifest().dimZ, x);
+        }
     }
 
     axialView_->setCrosshairPosition(x, y, z);
@@ -1115,6 +1143,10 @@ bool CTViewerWindow::loadSingleSliceFile(const std::string& filePath) {
         auto size2D = slice2D->GetLargestPossibleRegion().GetSize();
 
         // Convert 2D slice into a 1-slice 3D volume
+        dimX_ = static_cast<int>(size2D[0]);
+        dimY_ = static_cast<int>(size2D[1]);
+        dimZ_ = 1;
+
         originalVolume_ = VolumeType::New();
         VolumeType::RegionType region3D;
         VolumeType::IndexType start3D = {0, 0, 0};
@@ -1462,19 +1494,112 @@ void CTViewerWindow::onApplyFilterClicked() {
         return;
     }
 
-    if (!originalVolume_) {
-        if (isLazyLoadingMode_) {
-            if (!ensureFullVolumeLoaded()) return;
-        } else {
-            QMessageBox::warning(this, "Warning", "Please load a dataset first.");
-            return;
-        }
-    }
-
     int filterIdx = filterComboBox_->currentIndex();
     if (filterIdx == 0) {
         onResetFilterClicked();
         return;
+    }
+
+    bool currentSliceOnly = (!filterScopeCombo_ || filterScopeCombo_->currentIndex() == 0 || isSingleSlice_);
+
+    int curSliceX = sagittalView_->currentSlice();
+    int curSliceY = coronalView_->currentSlice();
+    int curSliceZ = axialView_->currentSlice();
+
+    int dimX = 0, dimY = 0, dimZ = 0;
+    double spacing[3] = {1.0, 1.0, 1.0};
+    double origin[3] = {0.0, 0.0, 0.0};
+
+    std::vector<uint16_t> sZData;
+    std::vector<uint16_t> sYData;
+    std::vector<uint16_t> sXData;
+    VolumeType::Pointer inputVol = nullptr;
+
+    if (currentSliceOnly) {
+        // Fast path: Apply filter only on the images/slices currently being shown (All 3 views)
+        if (isLazyLoadingMode_ && sliceStore_ && sliceStore_->isOpen()) {
+            dimX = sliceStore_->dimX();
+            dimY = sliceStore_->dimY();
+            dimZ = sliceStore_->dimZ();
+            sliceStore_->getSpacing(spacing);
+            sliceStore_->getOrigin(origin);
+
+            curSliceX = std::max(0, std::min(dimX - 1, curSliceX));
+            curSliceY = std::max(0, std::min(dimY - 1, curSliceY));
+            curSliceZ = std::max(0, std::min(dimZ - 1, curSliceZ));
+
+            auto sZ = sliceStore_->getSlice(2, curSliceZ);
+            auto sY = sliceStore_->getSlice(1, curSliceY);
+            auto sX = sliceStore_->getSlice(0, curSliceX);
+            if (!sZ || !sY || !sX) {
+                QMessageBox::warning(this, "Slice Error", "Could not retrieve orthogonal slices from store.");
+                return;
+            }
+            sZData = *sZ;
+            sYData = *sY;
+            sXData = *sX;
+        } else if (originalVolume_) {
+            auto fullRegion = originalVolume_->GetLargestPossibleRegion();
+            auto fullSize = fullRegion.GetSize();
+            dimX = static_cast<int>(fullSize[0]);
+            dimY = static_cast<int>(fullSize[1]);
+            dimZ = static_cast<int>(fullSize[2]);
+            for (int i = 0; i < 3; ++i) {
+                spacing[i] = originalVolume_->GetSpacing()[i];
+                origin[i] = originalVolume_->GetOrigin()[i];
+            }
+            curSliceX = std::max(0, std::min(dimX - 1, curSliceX));
+            curSliceY = std::max(0, std::min(dimY - 1, curSliceY));
+            curSliceZ = std::max(0, std::min(dimZ - 1, curSliceZ));
+
+            const uint16_t* srcBuf = originalVolume_->GetBufferPointer();
+
+            // Extract Axial slice (dimX * dimY)
+            sZData.resize(static_cast<size_t>(dimX) * dimY);
+            std::memcpy(sZData.data(), srcBuf + static_cast<size_t>(curSliceZ) * dimX * dimY, sZData.size() * sizeof(uint16_t));
+
+            // Extract Coronal slice (dimX * dimZ)
+            sYData.resize(static_cast<size_t>(dimX) * dimZ);
+            for (int z = 0; z < dimZ; ++z) {
+                std::memcpy(sYData.data() + static_cast<size_t>(z) * dimX,
+                            srcBuf + (static_cast<size_t>(z) * dimY + curSliceY) * dimX,
+                            dimX * sizeof(uint16_t));
+            }
+
+            // Extract Sagittal slice (dimY * dimZ)
+            sXData.resize(static_cast<size_t>(dimY) * dimZ);
+            for (int z = 0; z < dimZ; ++z) {
+                size_t zOffset = static_cast<size_t>(z) * dimY * dimX;
+                for (int y = 0; y < dimY; ++y) {
+                    sXData[static_cast<size_t>(z) * dimY + y] = srcBuf[zOffset + static_cast<size_t>(y) * dimX + curSliceX];
+                }
+            }
+        } else {
+            QMessageBox::warning(this, "Warning", "Please load a dataset first.");
+            return;
+        }
+
+        dimX_ = dimX;
+        dimY_ = dimY;
+        dimZ_ = dimZ;
+        currentOriginalZ_ = sZData;
+        currentOriginalY_ = sYData;
+        currentOriginalX_ = sXData;
+        filteredSliceZ_ = curSliceZ;
+        filteredSliceY_ = curSliceY;
+        filteredSliceX_ = curSliceX;
+
+    } else {
+        // Full 3D Volume mode
+        if (!originalVolume_) {
+            if (isLazyLoadingMode_) {
+                if (!ensureFullVolumeLoaded()) return;
+            } else {
+                QMessageBox::warning(this, "Warning", "Please load a dataset first.");
+                return;
+            }
+        }
+        inputVol = originalVolume_;
     }
 
     isProcessRunning_.store(true);
@@ -1501,14 +1626,22 @@ void CTViewerWindow::onApplyFilterClicked() {
     unsigned int anisoIters = static_cast<unsigned int>(anisoIterSpin_->value());
     double anisoCond = anisoConductanceSpin_->value();
     double anisoTimeStep = anisoTimeStepSpin_->value();
-    VolumeType::Pointer inputVol = originalVolume_;
+    bool isSingleSlice = isSingleSlice_;
 
-    activeWorkerThread_ = QThread::create([this, filterIdx, sigma, medianRadius, anisoIters, anisoCond, anisoTimeStep, inputVol]() {
+    activeWorkerThread_ = QThread::create([this, filterIdx, sigma, medianRadius, anisoIters, anisoCond, anisoTimeStep,
+                                          inputVol, currentSliceOnly, isSingleSlice,
+                                          dimX, dimY, dimZ, curSliceX, curSliceY, curSliceZ,
+                                          spacing, origin,
+                                          sZData = std::move(sZData),
+                                          sYData = std::move(sYData),
+                                          sXData = std::move(sXData)]() mutable {
         VolumeType::Pointer outVol = nullptr;
         QString filterName;
         bool aborted = false;
         QString errMsg;
         QElapsedTimer timer; timer.start();
+
+        std::vector<uint16_t> filtZData, filtYData, filtXData;
 
         auto makeObserver = [this]() {
             auto observer = itk::CStyleCommand::New();
@@ -1532,108 +1665,256 @@ void CTViewerWindow::onApplyFilterClicked() {
         };
 
         try {
-            if (filterIdx == 1) { // Gaussian Smoothing
-                filterName = QString("Gaussian (σ=%1)").arg(sigma);
-                using GaussType = itk::DiscreteGaussianImageFilter<VolumeType, VolumeType>;
-                auto filter = GaussType::New();
-                filter->SetInput(inputVol);
-                filter->SetVariance(sigma * sigma);
-                currentProcessObject_ = filter;
-                filter->AddObserver(itk::ProgressEvent(), makeObserver());
-                filter->Update();
-                if (cancelRequested_.load()) aborted = true;
-                else {
-                    outVol = filter->GetOutput();
-                    outVol->DisconnectPipeline();
-                }
+            if (currentSliceOnly) {
+                // -------------------------------------------------------------
+                // Fast 2D filtering on the current slices across all 3 views
+                // -------------------------------------------------------------
+                auto makeITK2DImage = [](const std::vector<uint16_t>& data, int w, int h, double spX, double spY) -> ImageType::Pointer {
+                    auto img = ImageType::New();
+                    ImageType::RegionType region;
+                    ImageType::IndexType start = {0, 0};
+                    ImageType::SizeType size = {static_cast<ImageType::SizeValueType>(w), static_cast<ImageType::SizeValueType>(h)};
+                    region.SetSize(size);
+                    region.SetIndex(start);
+                    img->SetRegions(region);
+                    ImageType::SpacingType sp;
+                    sp[0] = spX; sp[1] = spY;
+                    img->SetSpacing(sp);
+                    img->Allocate();
+                    std::memcpy(img->GetBufferPointer(), data.data(), data.size() * sizeof(uint16_t));
+                    return img;
+                };
 
-            } else if (filterIdx == 2) { // Median Filtering
-                filterName = QString("Median (r=%1)").arg(medianRadius);
-                using MedianType = itk::MedianImageFilter<VolumeType, VolumeType>;
-                auto filter = MedianType::New();
-                filter->SetInput(inputVol);
-                VolumeType::SizeType r; r.Fill(medianRadius);
-                filter->SetRadius(r);
-                currentProcessObject_ = filter;
-                filter->AddObserver(itk::ProgressEvent(), makeObserver());
-                filter->Update();
-                if (cancelRequested_.load()) aborted = true;
-                else {
-                    outVol = filter->GetOutput();
-                    outVol->DisconnectPipeline();
-                }
+                auto copyFromITK2DImage = [](ImageType::Pointer img, std::vector<uint16_t>& outData) {
+                    if (!img) return;
+                    auto region = img->GetLargestPossibleRegion();
+                    size_t numPixels = region.GetNumberOfPixels();
+                    outData.resize(numPixels);
+                    std::memcpy(outData.data(), img->GetBufferPointer(), numPixels * sizeof(uint16_t));
+                };
 
-            } else if (filterIdx == 3) { // Anisotropic Diffusion
-                filterName = QString("Anisotropic (iter=%1, c=%2)").arg(anisoIters).arg(anisoCond);
-                using FloatVolumeType = itk::Image<float, 3>;
-                using CastToFloatType = itk::CastImageFilter<VolumeType, FloatVolumeType>;
-                auto toFloat = CastToFloatType::New();
-                toFloat->SetInput(inputVol);
+                auto filterSlice2D = [&](ImageType::Pointer inSlice) -> ImageType::Pointer {
+                    if (!inSlice || cancelRequested_.load()) return nullptr;
+                    if (filterIdx == 1) { // Gaussian Smoothing
+                        using GaussType = itk::DiscreteGaussianImageFilter<ImageType, ImageType>;
+                        auto f = GaussType::New();
+                        f->SetInput(inSlice);
+                        f->SetVariance(sigma * sigma);
+                        f->Update();
+                        return f->GetOutput();
+                    } else if (filterIdx == 2) { // Median Filtering
+                        using MedianType = itk::MedianImageFilter<ImageType, ImageType>;
+                        auto f = MedianType::New();
+                        f->SetInput(inSlice);
+                        ImageType::SizeType r; r.Fill(medianRadius);
+                        f->SetRadius(r);
+                        f->Update();
+                        return f->GetOutput();
+                    } else if (filterIdx == 3) { // Anisotropic Diffusion
+                        using Float2DType = itk::Image<float, 2>;
+                        using CastToFloatType = itk::CastImageFilter<ImageType, Float2DType>;
+                        auto toFloat = CastToFloatType::New();
+                        toFloat->SetInput(inSlice);
 
-                using AnisoType = itk::GradientAnisotropicDiffusionImageFilter<FloatVolumeType, FloatVolumeType>;
-                auto filter = AnisoType::New();
-                filter->SetInput(toFloat->GetOutput());
-                filter->SetNumberOfIterations(anisoIters);
-                filter->SetConductanceParameter(anisoCond);
-                filter->SetTimeStep(anisoTimeStep);
-                currentProcessObject_ = filter;
-                filter->AddObserver(itk::ProgressEvent(), makeObserver());
+                        using AnisoType = itk::GradientAnisotropicDiffusionImageFilter<Float2DType, Float2DType>;
+                        auto aniso = AnisoType::New();
+                        aniso->SetInput(toFloat->GetOutput());
+                        aniso->SetNumberOfIterations(anisoIters);
+                        aniso->SetConductanceParameter(anisoCond);
+                        aniso->SetTimeStep(anisoTimeStep);
 
-                using CastBackType = itk::CastImageFilter<FloatVolumeType, VolumeType>;
-                auto toShort = CastBackType::New();
-                toShort->SetInput(filter->GetOutput());
-                toShort->Update();
-
-                if (cancelRequested_.load()) aborted = true;
-                else {
-                    outVol = toShort->GetOutput();
-                    outVol->DisconnectPipeline();
-                }
-
-            } else if (filterIdx == 4) { // Ring Artifact Correction
-                filterName = "Ring Artifact Corrected";
-                auto size = inputVol->GetLargestPossibleRegion().GetSize();
-                outVol = VolumeType::New();
-                outVol->SetRegions(inputVol->GetLargestPossibleRegion());
-                outVol->SetSpacing(inputVol->GetSpacing());
-                outVol->SetOrigin(inputVol->GetOrigin());
-                outVol->Allocate();
-
-                unsigned int numZ = static_cast<unsigned int>(size[2]);
-                for (unsigned int z = 0; z < numZ; ++z) {
-                    if (cancelRequested_.load()) {
-                        aborted = true;
-                        break;
+                        using CastBackType = itk::CastImageFilter<Float2DType, ImageType>;
+                        auto toShort = CastBackType::New();
+                        toShort->SetInput(aniso->GetOutput());
+                        toShort->Update();
+                        return toShort->GetOutput();
+                    } else if (filterIdx == 4) { // Ring Artifact Correction
+                        return Preprocessing::suppressRingArtifacts(inSlice);
                     }
+                    return inSlice;
+                };
 
-                    VolumeType::RegionType sliceReg = inputVol->GetLargestPossibleRegion();
-                    sliceReg.SetSize(2, 0);
-                    VolumeType::IndexType start = sliceReg.GetIndex();
-                    start[2] = z;
-                    sliceReg.SetIndex(start);
+                if (filterIdx == 1) filterName = QString("Gaussian (σ=%1) [Current Slices]").arg(sigma);
+                else if (filterIdx == 2) filterName = QString("Median (r=%1) [Current Slices]").arg(medianRadius);
+                else if (filterIdx == 3) filterName = QString("Anisotropic (iter=%1, c=%2) [Current Slices]").arg(anisoIters).arg(anisoCond);
+                else if (filterIdx == 4) filterName = "Ring Artifact Corrected [Current Slices]";
 
-                    using ExtType = itk::ExtractImageFilter<VolumeType, ImageType>;
-                    auto ext = ExtType::New();
-                    ext->SetExtractionRegion(sliceReg);
-                    ext->SetInput(inputVol);
-                    ext->SetDirectionCollapseToIdentity();
-                    ext->Update();
+                // Filter Axial slice
+                if (!sZData.empty() && !cancelRequested_.load()) {
+                    auto imgZ = makeITK2DImage(sZData, dimX, dimY, spacing[0], spacing[1]);
+                    auto outZ = filterSlice2D(imgZ);
+                    copyFromITK2DImage(outZ, filtZData);
+                }
+                QMetaObject::invokeMethod(this, [this]() {
+                    if (isProcessRunning_.load()) progressBar_->setValue(33);
+                }, Qt::QueuedConnection);
 
-                    ImageType::Pointer corrected = Preprocessing::suppressRingArtifacts(ext->GetOutput());
+                // Filter Coronal slice
+                if (!isSingleSlice && !sYData.empty() && !cancelRequested_.load()) {
+                    auto imgY = makeITK2DImage(sYData, dimX, dimZ, spacing[0], spacing[2]);
+                    auto outY = filterSlice2D(imgY);
+                    copyFromITK2DImage(outY, filtYData);
+                }
+                QMetaObject::invokeMethod(this, [this]() {
+                    if (isProcessRunning_.load()) progressBar_->setValue(66);
+                }, Qt::QueuedConnection);
 
-                    itk::ImageRegionConstIterator<ImageType> cIt(corrected, corrected->GetLargestPossibleRegion());
-                    sliceReg.SetSize(2, 1);
-                    itk::ImageRegionIterator<VolumeType> outIt(outVol, sliceReg);
-                    for (cIt.GoToBegin(), outIt.GoToBegin(); !cIt.IsAtEnd(); ++cIt, ++outIt) {
-                        outIt.Set(cIt.Get());
+                // Filter Sagittal slice
+                if (!isSingleSlice && !sXData.empty() && !cancelRequested_.load()) {
+                    auto imgX = makeITK2DImage(sXData, dimY, dimZ, spacing[1], spacing[2]);
+                    auto outX = filterSlice2D(imgX);
+                    copyFromITK2DImage(outX, filtXData);
+                }
+                QMetaObject::invokeMethod(this, [this]() {
+                    if (isProcessRunning_.load()) progressBar_->setValue(100);
+                }, Qt::QueuedConnection);
+
+                if (cancelRequested_.load()) {
+                    aborted = true;
+                } else {
+                    // Populate a 3D volume with the filtered slices at their corresponding planes
+                    outVol = VolumeType::New();
+                    VolumeType::RegionType region;
+                    VolumeType::IndexType start = {0, 0, 0};
+                    VolumeType::SizeType size = {static_cast<VolumeType::SizeValueType>(dimX),
+                                                static_cast<VolumeType::SizeValueType>(dimY),
+                                                static_cast<VolumeType::SizeValueType>(dimZ)};
+                    region.SetSize(size);
+                    region.SetIndex(start);
+                    outVol->SetRegions(region);
+                    outVol->SetSpacing(spacing);
+                    outVol->SetOrigin(origin);
+                    outVol->Allocate();
+                    std::memset(outVol->GetBufferPointer(), 0, static_cast<size_t>(dimX) * dimY * dimZ * sizeof(uint16_t));
+
+                    uint16_t* outBuf = outVol->GetBufferPointer();
+                    if (!filtZData.empty()) {
+                        std::memcpy(outBuf + static_cast<size_t>(curSliceZ) * dimX * dimY, filtZData.data(), filtZData.size() * sizeof(uint16_t));
                     }
-
-                    int pct = static_cast<int>((z + 1) * 100 / numZ);
-                    QMetaObject::invokeMethod(this, [this, pct]() {
-                        if (isProcessRunning_.load()) {
-                            progressBar_->setValue(pct);
+                    if (!filtYData.empty()) {
+                        for (int z = 0; z < dimZ; ++z) {
+                            std::memcpy(outBuf + (static_cast<size_t>(z) * dimY + curSliceY) * dimX,
+                                        filtYData.data() + static_cast<size_t>(z) * dimX,
+                                        dimX * sizeof(uint16_t));
                         }
-                    }, Qt::QueuedConnection);
+                    }
+                    if (!filtXData.empty()) {
+                        for (int z = 0; z < dimZ; ++z) {
+                            size_t zOffset = static_cast<size_t>(z) * dimY * dimX;
+                            for (int y = 0; y < dimY; ++y) {
+                                outBuf[zOffset + static_cast<size_t>(y) * dimX + curSliceX] = filtXData[static_cast<size_t>(z) * dimY + y];
+                            }
+                        }
+                    }
+                }
+
+            } else {
+                // -------------------------------------------------------------
+                // Full 3D Volume processing
+                // -------------------------------------------------------------
+                if (filterIdx == 1) { // Gaussian Smoothing
+                    filterName = QString("Gaussian (σ=%1)").arg(sigma);
+                    using GaussType = itk::DiscreteGaussianImageFilter<VolumeType, VolumeType>;
+                    auto filter = GaussType::New();
+                    filter->SetInput(inputVol);
+                    filter->SetVariance(sigma * sigma);
+                    currentProcessObject_ = filter;
+                    filter->AddObserver(itk::ProgressEvent(), makeObserver());
+                    filter->Update();
+                    if (cancelRequested_.load()) aborted = true;
+                    else {
+                        outVol = filter->GetOutput();
+                        outVol->DisconnectPipeline();
+                    }
+
+                } else if (filterIdx == 2) { // Median Filtering
+                    filterName = QString("Median (r=%1)").arg(medianRadius);
+                    using MedianType = itk::MedianImageFilter<VolumeType, VolumeType>;
+                    auto filter = MedianType::New();
+                    filter->SetInput(inputVol);
+                    VolumeType::SizeType r; r.Fill(medianRadius);
+                    filter->SetRadius(r);
+                    currentProcessObject_ = filter;
+                    filter->AddObserver(itk::ProgressEvent(), makeObserver());
+                    filter->Update();
+                    if (cancelRequested_.load()) aborted = true;
+                    else {
+                        outVol = filter->GetOutput();
+                        outVol->DisconnectPipeline();
+                    }
+
+                } else if (filterIdx == 3) { // Anisotropic Diffusion
+                    filterName = QString("Anisotropic (iter=%1, c=%2)").arg(anisoIters).arg(anisoCond);
+                    using FloatVolumeType = itk::Image<float, 3>;
+                    using CastToFloatType = itk::CastImageFilter<VolumeType, FloatVolumeType>;
+                    auto toFloat = CastToFloatType::New();
+                    toFloat->SetInput(inputVol);
+
+                    using AnisoType = itk::GradientAnisotropicDiffusionImageFilter<FloatVolumeType, FloatVolumeType>;
+                    auto filter = AnisoType::New();
+                    filter->SetInput(toFloat->GetOutput());
+                    filter->SetNumberOfIterations(anisoIters);
+                    filter->SetConductanceParameter(anisoCond);
+                    filter->SetTimeStep(anisoTimeStep);
+                    currentProcessObject_ = filter;
+                    filter->AddObserver(itk::ProgressEvent(), makeObserver());
+
+                    using CastBackType = itk::CastImageFilter<FloatVolumeType, VolumeType>;
+                    auto toShort = CastBackType::New();
+                    toShort->SetInput(filter->GetOutput());
+                    toShort->Update();
+
+                    if (cancelRequested_.load()) aborted = true;
+                    else {
+                        outVol = toShort->GetOutput();
+                        outVol->DisconnectPipeline();
+                    }
+
+                } else if (filterIdx == 4) { // Ring Artifact Correction
+                    filterName = "Ring Artifact Corrected";
+                    auto size = inputVol->GetLargestPossibleRegion().GetSize();
+                    outVol = VolumeType::New();
+                    outVol->SetRegions(inputVol->GetLargestPossibleRegion());
+                    outVol->SetSpacing(inputVol->GetSpacing());
+                    outVol->SetOrigin(inputVol->GetOrigin());
+                    outVol->Allocate();
+
+                    unsigned int numZ = static_cast<unsigned int>(size[2]);
+                    for (unsigned int z = 0; z < numZ; ++z) {
+                        if (cancelRequested_.load()) {
+                            aborted = true;
+                            break;
+                        }
+
+                        VolumeType::RegionType sliceReg = inputVol->GetLargestPossibleRegion();
+                        sliceReg.SetSize(2, 0);
+                        VolumeType::IndexType start = sliceReg.GetIndex();
+                        start[2] = z;
+                        sliceReg.SetIndex(start);
+
+                        using ExtType = itk::ExtractImageFilter<VolumeType, ImageType>;
+                        auto ext = ExtType::New();
+                        ext->SetExtractionRegion(sliceReg);
+                        ext->SetInput(inputVol);
+                        ext->SetDirectionCollapseToIdentity();
+                        ext->Update();
+
+                        ImageType::Pointer corrected = Preprocessing::suppressRingArtifacts(ext->GetOutput());
+
+                        itk::ImageRegionConstIterator<ImageType> cIt(corrected, corrected->GetLargestPossibleRegion());
+                        sliceReg.SetSize(2, 1);
+                        itk::ImageRegionIterator<VolumeType> outIt(outVol, sliceReg);
+                        for (cIt.GoToBegin(), outIt.GoToBegin(); !cIt.IsAtEnd(); ++cIt, ++outIt) {
+                            outIt.Set(cIt.Get());
+                        }
+
+                        int pct = static_cast<int>((z + 1) * 100 / numZ);
+                        QMetaObject::invokeMethod(this, [this, pct]() {
+                            if (isProcessRunning_.load()) {
+                                progressBar_->setValue(pct);
+                            }
+                        }, Qt::QueuedConnection);
+                    }
                 }
             }
         } catch (const itk::ProcessAborted&) {
@@ -1648,8 +1929,11 @@ void CTViewerWindow::onApplyFilterClicked() {
 
         if (cancelRequested_.load()) aborted = true;
 
-        QMetaObject::invokeMethod(this, [this, outVol, filterName, aborted, errMsg, elapsed = timer.elapsed()]() {
-            onFilterCompleted(outVol, filterName, aborted, errMsg, elapsed);
+        QMetaObject::invokeMethod(this, [this, outVol, filterName, aborted, errMsg, elapsed = timer.elapsed(),
+                                         fZ = std::move(filtZData),
+                                         fY = std::move(filtYData),
+                                         fX = std::move(filtXData)]() mutable {
+            onFilterCompleted(outVol, filterName, aborted, errMsg, elapsed, std::move(fZ), std::move(fY), std::move(fX));
         }, Qt::QueuedConnection);
     });
 
@@ -1657,7 +1941,8 @@ void CTViewerWindow::onApplyFilterClicked() {
     activeWorkerThread_->start();
 }
 
-void CTViewerWindow::onFilterCompleted(VolumeType::Pointer outVol, const QString& filterName, bool aborted, const QString& errMsg, qint64 elapsedMs) {
+void CTViewerWindow::onFilterCompleted(VolumeType::Pointer outVol, const QString& filterName, bool aborted, const QString& errMsg, qint64 elapsedMs,
+                                       std::vector<uint16_t> filtZ, std::vector<uint16_t> filtY, std::vector<uint16_t> filtX) {
     resetProcessUI();
 
     if (aborted) {
@@ -1673,12 +1958,31 @@ void CTViewerWindow::onFilterCompleted(VolumeType::Pointer outVol, const QString
     }
 
     filteredVolume_ = outVol;
-    displayVolume_ = filteredVolume_;
     compareFilterCheck_->blockSignals(true);
     compareFilterCheck_->setChecked(false);
     compareFilterCheck_->blockSignals(false);
     segSourceFilteredRadio_->setChecked(true);
-    updateVolumeDisplay();
+
+    if (!filtZ.empty()) {
+        currentFilteredZ_ = std::move(filtZ);
+        currentFilteredY_ = std::move(filtY);
+        currentFilteredX_ = std::move(filtX);
+        hasFilteredSlices_ = true;
+
+        if (axialView_ && !currentFilteredZ_.empty()) {
+            axialView_->setSliceData2D(currentFilteredZ_.data(), dimX_, dimY_, filteredSliceZ_);
+        }
+        if (coronalView_ && !currentFilteredY_.empty() && !isSingleSlice_) {
+            coronalView_->setSliceData2D(currentFilteredY_.data(), dimX_, dimZ_, filteredSliceY_);
+        }
+        if (sagittalView_ && !currentFilteredX_.empty() && !isSingleSlice_) {
+            sagittalView_->setSliceData2D(currentFilteredX_.data(), dimY_, dimZ_, filteredSliceX_);
+        }
+    } else {
+        hasFilteredSlices_ = false;
+        displayVolume_ = filteredVolume_;
+        updateVolumeDisplay();
+    }
 
     statusFilterLabel_->setText("Filter: " + filterName);
     statusPerfLabel_->setText(QString("Filter finished in %1 ms").arg(elapsedMs));
@@ -1686,6 +1990,16 @@ void CTViewerWindow::onFilterCompleted(VolumeType::Pointer outVol, const QString
 
 void CTViewerWindow::onResetFilterClicked() {
     filteredVolume_ = nullptr;
+    hasFilteredSlices_ = false;
+    currentFilteredZ_.clear();
+    currentFilteredY_.clear();
+    currentFilteredX_.clear();
+    currentOriginalZ_.clear();
+    currentOriginalY_.clear();
+    currentOriginalX_.clear();
+    filteredSliceZ_ = -1;
+    filteredSliceY_ = -1;
+    filteredSliceX_ = -1;
 
     filterComboBox_->blockSignals(true);
     filterComboBox_->setCurrentIndex(0);
@@ -1718,6 +2032,33 @@ void CTViewerWindow::onResetFilterClicked() {
 }
 
 void CTViewerWindow::onCompareFilterToggled(bool showOriginal) {
+    if (hasFilteredSlices_) {
+        if (showOriginal) {
+            if (!currentOriginalZ_.empty()) {
+                axialView_->setSliceData2D(currentOriginalZ_.data(), dimX_, dimY_, filteredSliceZ_);
+            }
+            if (!currentOriginalY_.empty() && !isSingleSlice_) {
+                coronalView_->setSliceData2D(currentOriginalY_.data(), dimX_, dimZ_, filteredSliceY_);
+            }
+            if (!currentOriginalX_.empty() && !isSingleSlice_) {
+                sagittalView_->setSliceData2D(currentOriginalX_.data(), dimY_, dimZ_, filteredSliceX_);
+            }
+            statusPerfLabel_->setText("Displaying Original CT Slices");
+        } else {
+            if (!currentFilteredZ_.empty()) {
+                axialView_->setSliceData2D(currentFilteredZ_.data(), dimX_, dimY_, filteredSliceZ_);
+            }
+            if (!currentFilteredY_.empty() && !isSingleSlice_) {
+                coronalView_->setSliceData2D(currentFilteredY_.data(), dimX_, dimZ_, filteredSliceY_);
+            }
+            if (!currentFilteredX_.empty() && !isSingleSlice_) {
+                sagittalView_->setSliceData2D(currentFilteredX_.data(), dimY_, dimZ_, filteredSliceX_);
+            }
+            statusPerfLabel_->setText("Displaying Filtered CT Slices");
+        }
+        return;
+    }
+
     if (!filteredVolume_) return;
     displayVolume_ = showOriginal ? originalVolume_ : filteredVolume_;
     updateVolumeDisplay();
@@ -1761,16 +2102,39 @@ void CTViewerWindow::onApplySegmentationClicked() {
             sliceStore_->getSpacing(spacing);
             sliceStore_->getOrigin(origin);
 
-            auto sZ = sliceStore_->getSlice(2, curSliceZ);
-            auto sY = sliceStore_->getSlice(1, curSliceY);
-            auto sX = sliceStore_->getSlice(0, curSliceX);
-            if (!sZ || !sY || !sX) {
-                QMessageBox::warning(this, "Slice Error", "Could not retrieve orthogonal slices from store.");
-                return;
+            bool useFiltered = segSourceFilteredRadio_->isChecked() && (filteredVolume_ != nullptr || hasFilteredSlices_);
+
+            if (useFiltered && hasFilteredSlices_) {
+                if (curSliceZ == filteredSliceZ_ && !currentFilteredZ_.empty()) {
+                    sZData = currentFilteredZ_;
+                } else {
+                    auto sZ = sliceStore_->getSlice(2, curSliceZ);
+                    if (sZ) sZData = *sZ;
+                }
+                if (curSliceY == filteredSliceY_ && !currentFilteredY_.empty()) {
+                    sYData = currentFilteredY_;
+                } else {
+                    auto sY = sliceStore_->getSlice(1, curSliceY);
+                    if (sY) sYData = *sY;
+                }
+                if (curSliceX == filteredSliceX_ && !currentFilteredX_.empty()) {
+                    sXData = currentFilteredX_;
+                } else {
+                    auto sX = sliceStore_->getSlice(0, curSliceX);
+                    if (sX) sXData = *sX;
+                }
+            } else {
+                auto sZ = sliceStore_->getSlice(2, curSliceZ);
+                auto sY = sliceStore_->getSlice(1, curSliceY);
+                auto sX = sliceStore_->getSlice(0, curSliceX);
+                if (!sZ || !sY || !sX) {
+                    QMessageBox::warning(this, "Slice Error", "Could not retrieve orthogonal slices from store.");
+                    return;
+                }
+                sZData = *sZ;
+                sYData = *sY;
+                sXData = *sX;
             }
-            sZData = *sZ;
-            sYData = *sY;
-            sXData = *sX;
         } else if (originalVolume_) {
             VolumeType::Pointer sourceVol = (segSourceFilteredRadio_->isChecked() && filteredVolume_)
                                                 ? filteredVolume_
