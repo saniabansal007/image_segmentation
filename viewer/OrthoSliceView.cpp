@@ -375,11 +375,12 @@ void OrthoSliceView::setVolumeData(vtkImageData* grayData, VolumeType::Pointer i
     sliceSlider_->setRange(minS, maxS);
     sliceSpinBox_->setRange(minS, maxS);
 
-    int mid = (minS + maxS) / 2;
-    sliceSlider_->setValue(mid);
-    sliceSpinBox_->setValue(mid);
-    grayMapper_->SetSliceNumber(mid);
-    maskFillMapper_->SetSliceNumber(mid);
+    int cur = (currentSliceIndex_ >= minS && currentSliceIndex_ <= maxS) ? currentSliceIndex_ : ((minS + maxS) / 2);
+    sliceSlider_->setValue(cur);
+    sliceSpinBox_->setValue(cur);
+    grayMapper_->SetSliceNumber(cur);
+    maskFillMapper_->SetSliceNumber(cur);
+    currentSliceIndex_ = cur;
 
     sliceSlider_->blockSignals(false);
     sliceSpinBox_->blockSignals(false);

@@ -1188,8 +1188,19 @@ void CTViewerWindow::updateVolumeDisplay() {
     coronalView_->setWindowLevel(w, l);
     sagittalView_->setWindowLevel(w, l);
 
-    auto size = displayVolume_->GetLargestPossibleRegion().GetSize();
-    onVoxelClicked(static_cast<int>(size[0] / 2), static_cast<int>(size[1] / 2), static_cast<int>(size[2] / 2));
+    axialView_->setSlice(currentCursor_[2]);
+    coronalView_->setSlice(currentCursor_[1]);
+    sagittalView_->setSlice(currentCursor_[0]);
+
+    axialView_->setCrosshairPosition(currentCursor_[0], currentCursor_[1], currentCursor_[2]);
+    coronalView_->setCrosshairPosition(currentCursor_[0], currentCursor_[1], currentCursor_[2]);
+    sagittalView_->setCrosshairPosition(currentCursor_[0], currentCursor_[1], currentCursor_[2]);
+
+    if (segmentationMask_) {
+        updateMaskDisplay();
+    }
+
+    updateStatusInfo();
 }
 
 void CTViewerWindow::updateMaskDisplay() {
@@ -1258,7 +1269,7 @@ void CTViewerWindow::onSliceChanged(int orientation, int sliceIndex) {
     else if (orientation == 1) currentCursor_[1] = sliceIndex;
     else if (orientation == 0) currentCursor_[0] = sliceIndex;
 
-    if (isLazyLoadingMode_ && sliceStore_) {
+    if (isLazyLoadingMode_ && sliceStore_ && !grayVTKData_) {
         uint64_t seq = ++sliceRequestSeq_;
         if (orientation == 2) {
             auto s = sliceStore_->getSlice(2, sliceIndex);
@@ -1276,6 +1287,10 @@ void CTViewerWindow::onSliceChanged(int orientation, int sliceIndex) {
                 sagittalView_->setSliceData2D(s->data(), sliceStore_->manifest().dimY, sliceStore_->manifest().dimZ, sliceIndex);
             }
         }
+    } else {
+        if (orientation == 2) axialView_->setSlice(sliceIndex);
+        else if (orientation == 1) coronalView_->setSlice(sliceIndex);
+        else if (orientation == 0) sagittalView_->setSlice(sliceIndex);
     }
 
     axialView_->setCrosshairPosition(currentCursor_[0], currentCursor_[1], currentCursor_[2]);
@@ -1290,7 +1305,7 @@ void CTViewerWindow::onVoxelClicked(int x, int y, int z) {
     currentCursor_[1] = y;
     currentCursor_[2] = z;
 
-    if (isLazyLoadingMode_ && sliceStore_) {
+    if (isLazyLoadingMode_ && sliceStore_ && !grayVTKData_) {
         requestSlicesForCursor(x, y, z);
     } else {
         axialView_->setSlice(z);
@@ -1311,8 +1326,13 @@ void CTViewerWindow::onVoxelClicked(int x, int y, int z) {
 }
 
 void CTViewerWindow::onVoxelHovered(int x, int y, int z, double intensity) {
-    if (isLazyLoadingMode_ && sliceStore_) {
+    if (isLazyLoadingMode_ && sliceStore_ && !grayVTKData_) {
         intensity = sliceStore_->getVoxelValue(x, y, z);
+    } else if (displayVolume_) {
+        VolumeType::IndexType idx = {x, y, z};
+        if (displayVolume_->GetLargestPossibleRegion().IsInside(idx)) {
+            intensity = static_cast<double>(displayVolume_->GetPixel(idx));
+        }
     }
     statusVoxelLabel_->setText(QString("Voxel: (%1, %2, %3) | Val: %4").arg(x).arg(y).arg(z).arg(intensity));
 }
@@ -1514,7 +1534,10 @@ void CTViewerWindow::onApplyFilterClicked() {
                 filter->AddObserver(itk::ProgressEvent(), makeObserver());
                 filter->Update();
                 if (cancelRequested_.load()) aborted = true;
-                else outVol = filter->GetOutput();
+                else {
+                    outVol = filter->GetOutput();
+                    outVol->DisconnectPipeline();
+                }
 
             } else if (filterIdx == 2) { // Median Filtering
                 filterName = QString("Median (r=%1)").arg(medianRadius);
@@ -1527,7 +1550,10 @@ void CTViewerWindow::onApplyFilterClicked() {
                 filter->AddObserver(itk::ProgressEvent(), makeObserver());
                 filter->Update();
                 if (cancelRequested_.load()) aborted = true;
-                else outVol = filter->GetOutput();
+                else {
+                    outVol = filter->GetOutput();
+                    outVol->DisconnectPipeline();
+                }
 
             } else if (filterIdx == 3) { // Anisotropic Diffusion
                 filterName = QString("Anisotropic (iter=%1, c=%2)").arg(anisoIters).arg(anisoCond);
@@ -1640,7 +1666,10 @@ void CTViewerWindow::onFilterCompleted(VolumeType::Pointer outVol, const QString
 
     filteredVolume_ = outVol;
     displayVolume_ = filteredVolume_;
+    compareFilterCheck_->blockSignals(true);
     compareFilterCheck_->setChecked(false);
+    compareFilterCheck_->blockSignals(false);
+    segSourceFilteredRadio_->setChecked(true);
     updateVolumeDisplay();
 
     statusFilterLabel_->setText("Filter: " + filterName);
@@ -1649,9 +1678,33 @@ void CTViewerWindow::onFilterCompleted(VolumeType::Pointer outVol, const QString
 
 void CTViewerWindow::onResetFilterClicked() {
     filteredVolume_ = nullptr;
-    displayVolume_ = originalVolume_;
+
+    filterComboBox_->blockSignals(true);
+    filterComboBox_->setCurrentIndex(0);
+    filterComboBox_->blockSignals(false);
+    filterParamsStack_->setCurrentIndex(0);
+
+    compareFilterCheck_->blockSignals(true);
     compareFilterCheck_->setChecked(false);
-    updateVolumeDisplay();
+    compareFilterCheck_->blockSignals(false);
+
+    segSourceOriginalRadio_->setChecked(true);
+
+    if (originalVolume_) {
+        displayVolume_ = originalVolume_;
+        updateVolumeDisplay();
+    } else if (isLazyLoadingMode_ && sliceStore_) {
+        grayVTKData_ = nullptr;
+        volumeToVTK_ = nullptr;
+        displayVolume_ = nullptr;
+        double sp[3] = {sliceStore_->manifest().spacingX, sliceStore_->manifest().spacingY, sliceStore_->manifest().spacingZ};
+        double orig[3] = {sliceStore_->manifest().originX, sliceStore_->manifest().originY, sliceStore_->manifest().originZ};
+        axialView_->initGeometry(sliceStore_->manifest().dimX, sliceStore_->manifest().dimY, sliceStore_->manifest().dimZ, sp, orig);
+        coronalView_->initGeometry(sliceStore_->manifest().dimX, sliceStore_->manifest().dimY, sliceStore_->manifest().dimZ, sp, orig);
+        sagittalView_->initGeometry(sliceStore_->manifest().dimX, sliceStore_->manifest().dimY, sliceStore_->manifest().dimZ, sp, orig);
+        requestSlicesForCursor(currentCursor_[0], currentCursor_[1], currentCursor_[2]);
+    }
+
     statusFilterLabel_->setText("Filter: None (Original)");
     statusPerfLabel_->setText("Reset to original image");
 }
