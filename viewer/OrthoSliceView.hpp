@@ -90,6 +90,7 @@ public:
 
     void resetCamera();
     void render();
+    void requestRender();
     void updateContour();
 
     // Internal handlers called by interactor style
@@ -102,6 +103,9 @@ signals:
     void voxelClicked(int x, int y, int z);
     void voxelHovered(int x, int y, int z, double intensity);
     void toggleMaximizeRequested(int orientation);
+
+protected:
+    bool eventFilter(QObject* obj, QEvent* event) override;
 
 private slots:
     void onSliderValueChanged(int val);
@@ -189,6 +193,7 @@ private:
     int currentSliceIndex_ = 0;
     int minSliceIndex_ = 0;
     int maxSliceIndex_ = 0;
+    bool renderPending_ = false;
 };
 
 } // namespace ctseg

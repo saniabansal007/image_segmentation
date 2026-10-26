@@ -19,6 +19,8 @@
 #include <QPixmap>
 #include <QElapsedTimer>
 #include <QDir>
+#include <QStyle>
+#include <QMouseEvent>
 
 // ITK Filters
 #include <itkMinimumMaximumImageCalculator.h>
@@ -143,6 +145,17 @@ bool CTViewerWindow::eventFilter(QObject* obj, QEvent* event) {
             stopRunningProcess();
             return true;
         }
+    } else if (event->type() == QEvent::MouseButtonPress) {
+        auto* me = static_cast<QMouseEvent*>(event);
+        if (me->button() == Qt::LeftButton) {
+            auto* slider = qobject_cast<QSlider*>(obj);
+            if (slider) {
+                int newPos = QStyle::sliderValueFromPosition(
+                    slider->minimum(), slider->maximum(),
+                    me->pos().x(), slider->width());
+                slider->setValue(newPos);
+            }
+        }
     }
     return QMainWindow::eventFilter(obj, event);
 }
@@ -151,8 +164,8 @@ void CTViewerWindow::applyDarkTheme() {
     setStyleSheet(
         "QMainWindow { background-color: #0F172A; }"
         "QWidget { color: #E2E8F0; font-family: 'Segoe UI', Arial, sans-serif; font-size: 12px; }"
-        "QGroupBox { font-weight: bold; font-size: 12px; border: 1px solid #334155; border-radius: 6px; margin-top: 10px; padding-top: 12px; background-color: #1E293B; }"
-        "QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; left: 10px; padding: 0 4px; color: #38BDF8; }"
+        "QGroupBox { font-weight: bold; font-size: 12px; border: 1px solid #334155; border-radius: 6px; margin-top: 22px; padding: 14px 8px 8px 8px; background-color: #1E293B; }"
+        "QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; left: 12px; top: 2px; padding: 2px 8px; color: #38BDF8; background-color: #1E293B; border: 1px solid #38BDF8; border-radius: 4px; font-weight: bold; font-size: 12px; }"
         "QPushButton { background-color: #2563EB; color: #FFFFFF; font-weight: bold; border-radius: 4px; padding: 6px 12px; border: none; }"
         "QPushButton:hover { background-color: #1D4ED8; }"
         "QPushButton:pressed { background-color: #1E40AF; }"
@@ -274,6 +287,7 @@ void CTViewerWindow::setupControlPanel(QWidget* panel) {
     windowSlider_ = new QSlider(Qt::Horizontal, infoGroup);
     windowSlider_->setRange(1, 65535);
     windowSlider_->setValue(1000);
+    windowSlider_->installEventFilter(this);
     connect(windowSlider_, &QSlider::valueChanged, this, &CTViewerWindow::onWindowSliderChanged);
     winLayout->addWidget(windowSlider_, 1);
     windowSpinBox_ = new QSpinBox(infoGroup);
@@ -289,6 +303,7 @@ void CTViewerWindow::setupControlPanel(QWidget* panel) {
     levelSlider_ = new QSlider(Qt::Horizontal, infoGroup);
     levelSlider_->setRange(0, 65535);
     levelSlider_->setValue(500);
+    levelSlider_->installEventFilter(this);
     connect(levelSlider_, &QSlider::valueChanged, this, &CTViewerWindow::onLevelSliderChanged);
     lvlLayout->addWidget(levelSlider_, 1);
     levelSpinBox_ = new QSpinBox(infoGroup);
@@ -604,7 +619,7 @@ void CTViewerWindow::setupControlPanel(QWidget* panel) {
     layout->addWidget(segGroup);
 
     // 4. CRITICAL: ROI BOUNDARY CONTOUR & VISUALIZATION
-    auto* roiGroup = new QGroupBox("ROI Boundary Contour & Fill (Requirement 6)", panel);
+    auto* roiGroup = new QGroupBox("ROI Boundary Contour & Fill", panel);
     auto* roiLayout = new QVBoxLayout(roiGroup);
     roiLayout->setSpacing(6);
 
@@ -644,6 +659,7 @@ void CTViewerWindow::setupControlPanel(QWidget* panel) {
     fillOpacitySlider_ = new QSlider(Qt::Horizontal, roiGroup);
     fillOpacitySlider_->setRange(0, 100);
     fillOpacitySlider_->setValue(35);
+    fillOpacitySlider_->installEventFilter(this);
     connect(fillOpacitySlider_, &QSlider::valueChanged, this, &CTViewerWindow::onFillOpacityChanged);
     opacLayout->addWidget(fillOpacitySlider_, 1);
     fillOpacityLabel_ = new QLabel("35%", roiGroup);
@@ -677,8 +693,8 @@ void CTViewerWindow::setupControlPanel(QWidget* panel) {
     roiLayout->addWidget(legendBox);
     layout->addWidget(roiGroup);
 
-    // 5. TIFF EXPORT PANEL (Requirement 7)
-    auto* exportGroup = new QGroupBox("TIFF Export (Requirement 7)", panel);
+    // 5. TIFF EXPORT PANEL
+    auto* exportGroup = new QGroupBox("TIFF Export", panel);
     auto* exportLayout = new QVBoxLayout(exportGroup);
     exportLayout->setSpacing(6);
 
@@ -1328,14 +1344,14 @@ void CTViewerWindow::onSliceChanged(int orientation, int sliceIndex) {
             }
         }
     } else {
-        if (orientation == 2) axialView_->setSlice(sliceIndex);
-        else if (orientation == 1) coronalView_->setSlice(sliceIndex);
-        else if (orientation == 0) sagittalView_->setSlice(sliceIndex);
+        if (orientation != 2 && axialView_->currentSlice() != currentCursor_[2]) axialView_->setSlice(currentCursor_[2]);
+        if (orientation != 1 && coronalView_->currentSlice() != currentCursor_[1]) coronalView_->setSlice(currentCursor_[1]);
+        if (orientation != 0 && sagittalView_->currentSlice() != currentCursor_[0]) sagittalView_->setSlice(currentCursor_[0]);
     }
 
-    axialView_->setCrosshairPosition(currentCursor_[0], currentCursor_[1], currentCursor_[2]);
-    coronalView_->setCrosshairPosition(currentCursor_[0], currentCursor_[1], currentCursor_[2]);
-    sagittalView_->setCrosshairPosition(currentCursor_[0], currentCursor_[1], currentCursor_[2]);
+    if (orientation != 2) axialView_->setCrosshairPosition(currentCursor_[0], currentCursor_[1], currentCursor_[2]);
+    if (orientation != 1) coronalView_->setCrosshairPosition(currentCursor_[0], currentCursor_[1], currentCursor_[2]);
+    if (orientation != 0) sagittalView_->setCrosshairPosition(currentCursor_[0], currentCursor_[1], currentCursor_[2]);
 
     updateStatusInfo();
 }

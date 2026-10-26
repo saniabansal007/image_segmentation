@@ -2,6 +2,9 @@
 
 #include <vtkObjectFactory.h>
 #include <vtkRenderWindowInteractor.h>
+#include <QTimer>
+#include <QMouseEvent>
+#include <QStyle>
 #include <algorithm>
 #include <cmath>
 
@@ -121,9 +124,10 @@ void OrthoSliceView::setupUI() {
     sliceSlider_->setStyleSheet(
         "QSlider::groove:horizontal { height: 4px; background: #37474F; border-radius: 2px; }"
         "QSlider::sub-page:horizontal { background: #29B6F6; border-radius: 2px; }"
-        "QSlider::handle:horizontal { background: #E0E0E0; width: 12px; margin-top: -4px; margin-bottom: -4px; border-radius: 6px; }"
+        "QSlider::handle:horizontal { background: #E0E0E0; width: 14px; margin-top: -5px; margin-bottom: -5px; border-radius: 7px; }"
         "QSlider::handle:horizontal:hover { background: #FFFFFF; }"
     );
+    sliceSlider_->installEventFilter(this);
     connect(sliceSlider_, &QSlider::valueChanged, this, &OrthoSliceView::onSliderValueChanged);
 
     nextButton_ = new QToolButton(botBar);
@@ -369,7 +373,7 @@ void OrthoSliceView::setSliceData2D(const uint16_t* data, int width, int height,
     updateBadgeText();
     updateCrosshairs();
     updateContour();
-    render();
+    requestRender();
 }
 
 void OrthoSliceView::setVolumeData(vtkImageData* grayData, VolumeType::Pointer itkVol) {
@@ -457,7 +461,7 @@ void OrthoSliceView::setSlice(int sliceIndex) {
         updateBadgeText();
         updateCrosshairs();
         updateContour();
-        render();
+        requestRender();
     } else {
         maskFillMapper_->SetSliceNumber(s);
         if (maskData_) {
@@ -471,7 +475,7 @@ void OrthoSliceView::setSlice(int sliceIndex) {
         updateBadgeText();
         updateCrosshairs();
         updateContour();
-        render();
+        requestRender();
     }
 }
 
@@ -493,7 +497,7 @@ int OrthoSliceView::maxSlice() const {
 void OrthoSliceView::setWindowLevel(double window, double level) {
     grayActor_->GetProperty()->SetColorWindow(window);
     grayActor_->GetProperty()->SetColorLevel(level);
-    render();
+    requestRender();
 }
 
 void OrthoSliceView::setCrosshairPosition(int x, int y, int z) {
@@ -502,20 +506,20 @@ void OrthoSliceView::setCrosshairPosition(int x, int y, int z) {
     cursorCoords_[2] = z;
 
     updateCrosshairs();
-    render();
+    requestRender();
 }
 
 void OrthoSliceView::setCrosshairVisible(bool visible) {
     crosshairVisible_ = visible;
     crosshairHActor_->SetVisibility(visible);
     crosshairVActor_->SetVisibility(visible);
-    render();
+    requestRender();
 }
 
 void OrthoSliceView::setBoundaryVisible(bool visible) {
     boundaryVisible_ = visible;
     updateContour();
-    render();
+    requestRender();
 }
 
 void OrthoSliceView::setBoundaryColor(double r, double g, double b) {
@@ -523,26 +527,26 @@ void OrthoSliceView::setBoundaryColor(double r, double g, double b) {
     boundaryColor_[1] = g;
     boundaryColor_[2] = b;
     contourActor_->GetProperty()->SetColor(r, g, b);
-    render();
+    requestRender();
 }
 
 void OrthoSliceView::setBoundaryLineWidth(float width) {
     boundaryWidth_ = width;
     contourActor_->GetProperty()->SetLineWidth(width);
-    render();
+    requestRender();
 }
 
 void OrthoSliceView::setFillVisible(bool visible) {
     fillVisible_ = visible;
     maskFillActor_->SetVisibility(visible && (maskData_ != nullptr));
-    render();
+    requestRender();
 }
 
 void OrthoSliceView::setFillOpacity(double opacity) {
     fillOpacity_ = opacity;
     maskLut_->SetTableValue(1, fillColor_[0], fillColor_[1], fillColor_[2], opacity);
     maskLut_->Build();
-    render();
+    requestRender();
 }
 
 void OrthoSliceView::setFillColor(double r, double g, double b) {
@@ -551,7 +555,7 @@ void OrthoSliceView::setFillColor(double r, double g, double b) {
     fillColor_[2] = b;
     maskLut_->SetTableValue(1, r, g, b, fillOpacity_);
     maskLut_->Build();
-    render();
+    requestRender();
 }
 
 void OrthoSliceView::resetCamera() {
@@ -568,7 +572,21 @@ void OrthoSliceView::resetCamera() {
 }
 
 void OrthoSliceView::render() {
-    if (renWin_) renWin_->Render();
+    renderPending_ = false;
+    if (renWin_ && isVisible()) {
+        renWin_->Render();
+    }
+}
+
+void OrthoSliceView::requestRender() {
+    if (!renderPending_) {
+        renderPending_ = true;
+        QTimer::singleShot(0, this, [this]() {
+            if (renderPending_) {
+                render();
+            }
+        });
+    }
 }
 
 void OrthoSliceView::updateContour() {
@@ -709,18 +727,45 @@ void OrthoSliceView::handleVoxelHovered(const double worldPos[3]) {
     }
 }
 
+bool OrthoSliceView::eventFilter(QObject* obj, QEvent* event) {
+    if (obj == sliceSlider_ && event->type() == QEvent::MouseButtonPress) {
+        auto* me = static_cast<QMouseEvent*>(event);
+        if (me->button() == Qt::LeftButton) {
+            int newPos = QStyle::sliderValueFromPosition(
+                sliceSlider_->minimum(), sliceSlider_->maximum(),
+                me->pos().x(), sliceSlider_->width());
+            sliceSlider_->setValue(newPos);
+        }
+    }
+    return QWidget::eventFilter(obj, event);
+}
+
 void OrthoSliceView::stepSlice(int delta) {
-    setSlice(currentSlice() + delta);
-    emit sliceChanged(orientation_, currentSlice());
+    int target = std::max(minSlice(), std::min(maxSlice(), currentSlice() + delta));
+    sliceSlider_->setValue(target);
 }
 
 void OrthoSliceView::onSliderValueChanged(int val) {
-    setSlice(val);
+    if (!isLazyMode_) {
+        setSlice(val);
+    } else {
+        currentSliceIndex_ = val;
+        sliceSpinBox_->blockSignals(true);
+        sliceSpinBox_->setValue(val);
+        sliceSpinBox_->blockSignals(false);
+    }
     emit sliceChanged(orientation_, val);
 }
 
 void OrthoSliceView::onSpinBoxValueChanged(int val) {
-    setSlice(val);
+    if (!isLazyMode_) {
+        setSlice(val);
+    } else {
+        currentSliceIndex_ = val;
+        sliceSlider_->blockSignals(true);
+        sliceSlider_->setValue(val);
+        sliceSlider_->blockSignals(false);
+    }
     emit sliceChanged(orientation_, val);
 }
 
