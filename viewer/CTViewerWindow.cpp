@@ -3,6 +3,11 @@
 #include "../io/SliceIO.hpp"
 #include "../preprocessing/Preprocessing.hpp"
 
+#if defined(HAVE_CUDA)
+#include "../gpu/GPUPreprocessing.hpp"
+#include "../gpu/GPUSegmentation.hpp"
+#endif
+
 #include <QApplication>
 #include <QMenuBar>
 #include <QMenu>
@@ -1830,6 +1835,22 @@ void CTViewerWindow::onApplyFilterClicked() {
                 // -------------------------------------------------------------
                 if (filterIdx == 1) { // Gaussian Smoothing
                     filterName = QString("Gaussian (σ=%1)").arg(sigma);
+#if defined(HAVE_CUDA)
+                    filterName += " [GPU Accelerated]";
+                    try {
+                        outVol = ctseg::GPUPreprocessing::gaussianSmoothGPU(inputVol, sigma);
+                    } catch (const std::exception& e) {
+                        using GaussType = itk::DiscreteGaussianImageFilter<VolumeType, VolumeType>;
+                        auto filter = GaussType::New();
+                        filter->SetInput(inputVol);
+                        filter->SetVariance(sigma * sigma);
+                        currentProcessObject_ = filter;
+                        filter->AddObserver(itk::ProgressEvent(), makeObserver());
+                        filter->Update();
+                        outVol = filter->GetOutput();
+                        outVol->DisconnectPipeline();
+                    }
+#else
                     using GaussType = itk::DiscreteGaussianImageFilter<VolumeType, VolumeType>;
                     auto filter = GaussType::New();
                     filter->SetInput(inputVol);
@@ -1842,9 +1863,44 @@ void CTViewerWindow::onApplyFilterClicked() {
                         outVol = filter->GetOutput();
                         outVol->DisconnectPipeline();
                     }
+#endif
 
                 } else if (filterIdx == 2) { // Median Filtering
                     filterName = QString("Median (r=%1)").arg(medianRadius);
+#if defined(HAVE_CUDA)
+                    if (medianRadius == 1) {
+                        filterName += " [GPU Accelerated]";
+                        try {
+                            outVol = ctseg::GPUPreprocessing::denoiseMedianGPU(inputVol, 1);
+                        } catch (const std::exception& e) {
+                            // Fallback to CPU if GPU memory allocation fails
+                            using MedianType = itk::MedianImageFilter<VolumeType, VolumeType>;
+                            auto filter = MedianType::New();
+                            filter->SetInput(inputVol);
+                            VolumeType::SizeType r; r.Fill(medianRadius);
+                            filter->SetRadius(r);
+                            currentProcessObject_ = filter;
+                            filter->AddObserver(itk::ProgressEvent(), makeObserver());
+                            filter->Update();
+                            outVol = filter->GetOutput();
+                            outVol->DisconnectPipeline();
+                        }
+                    } else {
+                        using MedianType = itk::MedianImageFilter<VolumeType, VolumeType>;
+                        auto filter = MedianType::New();
+                        filter->SetInput(inputVol);
+                        VolumeType::SizeType r; r.Fill(medianRadius);
+                        filter->SetRadius(r);
+                        currentProcessObject_ = filter;
+                        filter->AddObserver(itk::ProgressEvent(), makeObserver());
+                        filter->Update();
+                        if (cancelRequested_.load()) aborted = true;
+                        else {
+                            outVol = filter->GetOutput();
+                            outVol->DisconnectPipeline();
+                        }
+                    }
+#else
                     using MedianType = itk::MedianImageFilter<VolumeType, VolumeType>;
                     auto filter = MedianType::New();
                     filter->SetInput(inputVol);
@@ -1858,6 +1914,7 @@ void CTViewerWindow::onApplyFilterClicked() {
                         outVol = filter->GetOutput();
                         outVol->DisconnectPipeline();
                     }
+#endif
 
                 } else if (filterIdx == 3) { // Anisotropic Diffusion
                     filterName = QString("Anisotropic (iter=%1, c=%2)").arg(anisoIters).arg(anisoCond);
@@ -2244,9 +2301,45 @@ void CTViewerWindow::onApplySegmentationClicked() {
                 return;
             }
         }
-        inputVol = (segSourceFilteredRadio_->isChecked() && filteredVolume_)
-                        ? filteredVolume_
-                        : originalVolume_;
+        if (segSourceFilteredRadio_->isChecked()) {
+            if (!filteredVolume_ && originalVolume_) {
+                statusPerfLabel_->setText("GPU: Preprocessing full 3D volume on CUDA...");
+                progressBar_->setVisible(true);
+                progressBar_->setValue(15);
+                QApplication::processEvents();
+
+                int fIdx = filterComboBox_ ? filterComboBox_->currentIndex() : 2;
+                double sigma = gaussianSigmaSpin_ ? gaussianSigmaSpin_->value() : 1.0;
+#if defined(HAVE_CUDA)
+                try {
+                    if (fIdx == 1) {
+                        filteredVolume_ = ctseg::GPUPreprocessing::gaussianSmoothGPU(originalVolume_, sigma);
+                    } else {
+                        filteredVolume_ = ctseg::GPUPreprocessing::denoiseMedianGPU(originalVolume_, 1);
+                    }
+                } catch (...) {
+                    filteredVolume_ = originalVolume_;
+                }
+#else
+                filteredVolume_ = originalVolume_;
+#endif
+                displayVolume_ = filteredVolume_;
+            }
+            inputVol = filteredVolume_ ? filteredVolume_ : originalVolume_;
+        } else {
+            inputVol = originalVolume_;
+        }
+        if (inputVol) {
+            auto fullRegion = inputVol->GetLargestPossibleRegion();
+            auto fullSize = fullRegion.GetSize();
+            dimX = static_cast<int>(fullSize[0]);
+            dimY = static_cast<int>(fullSize[1]);
+            dimZ = static_cast<int>(fullSize[2]);
+            for (int i = 0; i < 3; ++i) {
+                spacing[i] = inputVol->GetSpacing()[i];
+                origin[i] = inputVol->GetOrigin()[i];
+            }
+        }
     }
 
     int algIdx = algorithmComboBox_->currentIndex();
@@ -2498,62 +2591,114 @@ void CTViewerWindow::onApplySegmentationClicked() {
                     }
                 }
             } else if (algIdx == 0) { // Threshold Range
-                using FilterType = itk::BinaryThresholdImageFilter<VolumeType, LabelVolumeType>;
-                auto filter = FilterType::New();
-                filter->SetInput(inputVol);
-                filter->SetLowerThreshold(lo);
-                filter->SetUpperThreshold(hi);
-                filter->SetInsideValue(1);
-                filter->SetOutsideValue(0);
-                currentProcessObject_ = filter;
-                filter->AddObserver(itk::ProgressEvent(), makeObserver());
-                filter->Update();
-                if (cancelRequested_.load()) aborted = true;
-                else {
-                    outMask = filter->GetOutput();
-                    segName = QString("Threshold [%1, %2]").arg(lo).arg(hi);
+#if defined(HAVE_CUDA)
+                bool gpuDone = false;
+                try {
+                    unsigned int gpuFg = 0;
+                    outMask = ctseg::GPUSegmentation::thresholdGPU(inputVol, lo, hi, gpuFg);
+                    fgCount = gpuFg;
+                    segName = QString("Threshold [%1, %2] [CUDA GPU]").arg(lo).arg(hi);
+                    gpuDone = true;
+                } catch (const std::exception& e) {
+                    gpuDone = false;
+                }
+                if (!gpuDone)
+#endif
+                {
+                    using FilterType = itk::BinaryThresholdImageFilter<VolumeType, LabelVolumeType>;
+                    auto filter = FilterType::New();
+                    filter->SetInput(inputVol);
+                    filter->SetLowerThreshold(lo);
+                    filter->SetUpperThreshold(hi);
+                    filter->SetInsideValue(1);
+                    filter->SetOutsideValue(0);
+                    currentProcessObject_ = filter;
+                    filter->AddObserver(itk::ProgressEvent(), makeObserver());
+                    filter->Update();
+                    if (cancelRequested_.load()) aborted = true;
+                    else {
+                        outMask = filter->GetOutput();
+                        segName = QString("Threshold [%1, %2] [CPU]").arg(lo).arg(hi);
+                    }
                 }
 
             } else if (algIdx == 1) { // Global Otsu
-                using FilterType = itk::OtsuThresholdImageFilter<VolumeType, LabelVolumeType>;
-                auto filter = FilterType::New();
-                filter->SetInput(inputVol);
-                filter->SetInsideValue(0);
-                filter->SetOutsideValue(1);
-                currentProcessObject_ = filter;
-                filter->AddObserver(itk::ProgressEvent(), makeObserver());
-                filter->Update();
-                if (cancelRequested_.load()) aborted = true;
-                else {
-                    outMask = filter->GetOutput();
-                    segName = QString("Global Otsu (thresh=%1)").arg(filter->GetThreshold());
+#if defined(HAVE_CUDA)
+                bool gpuDone = false;
+                try {
+                    unsigned short otsuThresh = 0;
+                    unsigned int gpuFg = 0;
+                    outMask = ctseg::GPUSegmentation::otsuGPU(inputVol, static_cast<unsigned short>(minVox), static_cast<unsigned short>(maxVox), otsuThresh, gpuFg);
+                    fgCount = gpuFg;
+                    segName = QString("Global Otsu (thresh=%1) [CUDA GPU]").arg(otsuThresh);
+                    gpuDone = true;
+                } catch (const std::exception& e) {
+                    gpuDone = false;
+                }
+                if (!gpuDone)
+#endif
+                {
+                    using FilterType = itk::OtsuThresholdImageFilter<VolumeType, LabelVolumeType>;
+                    auto filter = FilterType::New();
+                    filter->SetInput(inputVol);
+                    filter->SetInsideValue(0);
+                    filter->SetOutsideValue(1);
+                    currentProcessObject_ = filter;
+                    filter->AddObserver(itk::ProgressEvent(), makeObserver());
+                    filter->Update();
+                    if (cancelRequested_.load()) aborted = true;
+                    else {
+                        outMask = filter->GetOutput();
+                        segName = QString("Global Otsu (thresh=%1) [CPU]").arg(filter->GetThreshold());
+                    }
                 }
 
             } else if (algIdx == 2) { // Multi-Otsu
-                using FilterType = itk::OtsuMultipleThresholdsImageFilter<VolumeType, LabelVolumeType>;
-                auto filter = FilterType::New();
-                filter->SetInput(inputVol);
-                filter->SetNumberOfThresholds(numClasses - 1);
-                currentProcessObject_ = filter;
-                filter->AddObserver(itk::ProgressEvent(), makeObserver());
-                filter->Update();
-
-                if (cancelRequested_.load()) aborted = true;
-                else {
-                    auto rawMask = filter->GetOutput();
-                    outMask = LabelVolumeType::New();
-                    outMask->SetRegions(rawMask->GetLargestPossibleRegion());
-                    outMask->SetSpacing(rawMask->GetSpacing());
-                    outMask->SetOrigin(rawMask->GetOrigin());
-                    outMask->Allocate();
-
-                    itk::ImageRegionConstIterator<LabelVolumeType> inIt(rawMask, rawMask->GetLargestPossibleRegion());
-                    itk::ImageRegionIterator<LabelVolumeType> oIt(outMask, outMask->GetLargestPossibleRegion());
-                    for (inIt.GoToBegin(), oIt.GoToBegin(); !inIt.IsAtEnd(); ++inIt, ++oIt) {
-                        if (cancelRequested_.load()) { aborted = true; break; }
-                        oIt.Set(inIt.Get() == targetClass ? 1 : 0);
+#if defined(HAVE_CUDA)
+                bool gpuDone = false;
+                try {
+                    std::vector<unsigned short> threshs;
+                    unsigned int gpuFg = 0;
+                    outMask = ctseg::GPUSegmentation::multiOtsuGPU(inputVol, static_cast<unsigned short>(minVox), static_cast<unsigned short>(maxVox), numClasses, targetClass, threshs, gpuFg);
+                    fgCount = gpuFg;
+                    QString thStr;
+                    for (size_t t = 0; t < threshs.size(); ++t) {
+                        if (t > 0) thStr += ", ";
+                        thStr += QString::number(threshs[t]);
                     }
-                    segName = QString("Multi-Otsu (%1 cls, target %2)").arg(numClasses).arg(targetClass);
+                    segName = QString("Multi-Otsu (%1 cls, target %2, th=[%3]) [CUDA GPU]").arg(numClasses).arg(targetClass).arg(thStr);
+                    gpuDone = true;
+                } catch (const std::exception& e) {
+                    gpuDone = false;
+                }
+                if (!gpuDone)
+#endif
+                {
+                    using FilterType = itk::OtsuMultipleThresholdsImageFilter<VolumeType, LabelVolumeType>;
+                    auto filter = FilterType::New();
+                    filter->SetInput(inputVol);
+                    filter->SetNumberOfThresholds(numClasses - 1);
+                    currentProcessObject_ = filter;
+                    filter->AddObserver(itk::ProgressEvent(), makeObserver());
+                    filter->Update();
+
+                    if (cancelRequested_.load()) aborted = true;
+                    else {
+                        auto rawMask = filter->GetOutput();
+                        outMask = LabelVolumeType::New();
+                        outMask->SetRegions(rawMask->GetLargestPossibleRegion());
+                        outMask->SetSpacing(rawMask->GetSpacing());
+                        outMask->SetOrigin(rawMask->GetOrigin());
+                        outMask->Allocate();
+
+                        itk::ImageRegionConstIterator<LabelVolumeType> inIt(rawMask, rawMask->GetLargestPossibleRegion());
+                        itk::ImageRegionIterator<LabelVolumeType> oIt(outMask, outMask->GetLargestPossibleRegion());
+                        for (inIt.GoToBegin(), oIt.GoToBegin(); !inIt.IsAtEnd(); ++inIt, ++oIt) {
+                            if (cancelRequested_.load()) { aborted = true; break; }
+                            oIt.Set(inIt.Get() == targetClass ? 1 : 0);
+                        }
+                        segName = QString("Multi-Otsu (%1 cls, target %2) [CPU]").arg(numClasses).arg(targetClass);
+                    }
                 }
 
             } else if (algIdx == 3) { // Confidence Connected Region Growing
@@ -2586,21 +2731,36 @@ void CTViewerWindow::onApplySegmentationClicked() {
                 }
 
             } else if (algIdx == 4) { // Connected Threshold
-                using ConnType = itk::ConnectedThresholdImageFilter<VolumeType, LabelVolumeType>;
-                auto conn = ConnType::New();
-                conn->SetInput(inputVol);
-                conn->AddSeed(seed);
-                conn->SetLower(connLo);
-                conn->SetUpper(connHi);
-                conn->SetReplaceValue(1);
-                currentProcessObject_ = conn;
-                conn->AddObserver(itk::ProgressEvent(), makeObserver());
-                conn->Update();
+#if defined(HAVE_CUDA)
+                bool gpuDone = false;
+                try {
+                    unsigned int gpuFg = 0;
+                    outMask = ctseg::GPUSegmentation::connectedThresholdGPU(inputVol, seed[0], seed[1], seed[2], connLo, connHi, gpuFg);
+                    fgCount = gpuFg;
+                    segName = QString("Conn Thresh [%1, %2] (seed: %3,%4,%5) [CUDA GPU]").arg(connLo).arg(connHi).arg(seed[0]).arg(seed[1]).arg(seed[2]);
+                    gpuDone = true;
+                } catch (const std::exception& e) {
+                    gpuDone = false;
+                }
+                if (!gpuDone)
+#endif
+                {
+                    using ConnType = itk::ConnectedThresholdImageFilter<VolumeType, LabelVolumeType>;
+                    auto conn = ConnType::New();
+                    conn->SetInput(inputVol);
+                    conn->AddSeed(seed);
+                    conn->SetLower(connLo);
+                    conn->SetUpper(connHi);
+                    conn->SetReplaceValue(1);
+                    currentProcessObject_ = conn;
+                    conn->AddObserver(itk::ProgressEvent(), makeObserver());
+                    conn->Update();
 
-                if (cancelRequested_.load()) aborted = true;
-                else {
-                    outMask = conn->GetOutput();
-                    segName = QString("Conn Thresh [%1, %2]").arg(connLo).arg(connHi);
+                    if (cancelRequested_.load()) aborted = true;
+                    else {
+                        outMask = conn->GetOutput();
+                        segName = QString("Conn Thresh [%1, %2] [CPU]").arg(connLo).arg(connHi);
+                    }
                 }
 
             } else if (algIdx == 5) { // K-Means Clustering
@@ -2635,19 +2795,34 @@ void CTViewerWindow::onApplySegmentationClicked() {
                 }
 
             } else if (algIdx == 6) { // Canny Morphology
-                using OtsuType = itk::OtsuThresholdImageFilter<VolumeType, LabelVolumeType>;
-                auto otsu = OtsuType::New();
-                otsu->SetInput(inputVol);
-                otsu->SetInsideValue(0);
-                otsu->SetOutsideValue(1);
-                currentProcessObject_ = otsu;
-                otsu->AddObserver(itk::ProgressEvent(), makeObserver());
-                otsu->Update();
+#if defined(HAVE_CUDA)
+                bool gpuDone = false;
+                try {
+                    unsigned int gpuFg = 0;
+                    outMask = ctseg::GPUSegmentation::cannyMorphologyGPU(inputVol, static_cast<unsigned short>(minVox), static_cast<unsigned short>(maxVox), 2, gpuFg);
+                    fgCount = gpuFg;
+                    segName = "Canny Edge + Morphological Closing [CUDA GPU]";
+                    gpuDone = true;
+                } catch (const std::exception& e) {
+                    gpuDone = false;
+                }
+                if (!gpuDone)
+#endif
+                {
+                    using OtsuType = itk::OtsuThresholdImageFilter<VolumeType, LabelVolumeType>;
+                    auto otsu = OtsuType::New();
+                    otsu->SetInput(inputVol);
+                    otsu->SetInsideValue(0);
+                    otsu->SetOutsideValue(1);
+                    currentProcessObject_ = otsu;
+                    otsu->AddObserver(itk::ProgressEvent(), makeObserver());
+                    otsu->Update();
 
-                if (cancelRequested_.load()) aborted = true;
-                else {
-                    outMask = otsu->GetOutput();
-                    segName = "Canny Morphology";
+                    if (cancelRequested_.load()) aborted = true;
+                    else {
+                        outMask = otsu->GetOutput();
+                        segName = "Canny Morphology [CPU]";
+                    }
                 }
 
             } else if (algIdx == 7) { // Watershed Segmentation
@@ -2667,7 +2842,7 @@ void CTViewerWindow::onApplySegmentationClicked() {
                 }
             }
 
-            if (outMask && !aborted && !cancelRequested_.load()) {
+            if (outMask && !aborted && !cancelRequested_.load() && fgCount == 0) {
                 itk::ImageRegionConstIterator<LabelVolumeType> it(outMask, outMask->GetLargestPossibleRegion());
                 for (it.GoToBegin(); !it.IsAtEnd(); ++it) {
                     if (cancelRequested_.load()) { aborted = true; break; }

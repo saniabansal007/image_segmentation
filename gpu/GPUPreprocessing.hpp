@@ -8,10 +8,12 @@
 // C++ (no __global__/CUDA syntax), so it can be included from ordinary
 // .cpp files without needing nvcc. The actual kernel calls are compiled
 // separately by nvcc into MedianFilter3D.cu.o / Morphology3D.cu.o and
-// linked in normally by the C++ linker.
 namespace ctseg_gpu {
     void medianFilter3D(const std::vector<unsigned short>& input, std::vector<unsigned short>& output,
                          int width, int height, int depth, int radius);
+
+    void gaussianFilter3D(const std::vector<unsigned short>& input, std::vector<unsigned short>& output,
+                          int width, int height, int depth, double sigma);
 
     enum class MorphOp { Erode, Dilate };
     void morphology3D(const std::vector<unsigned char>& input, std::vector<unsigned char>& output,
@@ -34,11 +36,17 @@ public:
         auto region = input->GetLargestPossibleRegion();
         auto size = region.GetSize();
         int w = size[0], h = size[1], d = size[2];
+        size_t numVoxels = static_cast<size_t>(w) * h * d;
 
-        std::vector<unsigned short> inBuf(static_cast<size_t>(w) * h * d);
-        itk::ImageRegionConstIterator<VolumeType> it(input, region);
-        size_t i = 0;
-        for (it.GoToBegin(); !it.IsAtEnd(); ++it) inBuf[i++] = it.Get();
+        std::vector<unsigned short> inBuf(numVoxels);
+        const unsigned short* srcPtr = input->GetBufferPointer();
+        if (srcPtr) {
+            std::memcpy(inBuf.data(), srcPtr, numVoxels * sizeof(unsigned short));
+        } else {
+            itk::ImageRegionConstIterator<VolumeType> it(input, region);
+            size_t i = 0;
+            for (it.GoToBegin(); !it.IsAtEnd(); ++it) inBuf[i++] = it.Get();
+        }
 
         std::vector<unsigned short> outBuf;
         ctseg_gpu::medianFilter3D(inBuf, outBuf, w, h, d, radius);
@@ -48,9 +56,49 @@ public:
         output->SetSpacing(input->GetSpacing());
         output->SetOrigin(input->GetOrigin());
         output->Allocate();
-        itk::ImageRegionIterator<VolumeType> outIt(output, region);
-        i = 0;
-        for (outIt.GoToBegin(); !outIt.IsAtEnd(); ++outIt) outIt.Set(outBuf[i++]);
+        unsigned short* dstPtr = output->GetBufferPointer();
+        if (dstPtr) {
+            std::memcpy(dstPtr, outBuf.data(), numVoxels * sizeof(unsigned short));
+        } else {
+            itk::ImageRegionIterator<VolumeType> outIt(output, region);
+            size_t i = 0;
+            for (outIt.GoToBegin(); !outIt.IsAtEnd(); ++outIt) outIt.Set(outBuf[i++]);
+        }
+        return output;
+    }
+
+    static VolumeType::Pointer gaussianSmoothGPU(VolumeType::Pointer input, double sigma = 1.0) {
+        auto region = input->GetLargestPossibleRegion();
+        auto size = region.GetSize();
+        int w = size[0], h = size[1], d = size[2];
+        size_t numVoxels = static_cast<size_t>(w) * h * d;
+
+        std::vector<unsigned short> inBuf(numVoxels);
+        const unsigned short* srcPtr = input->GetBufferPointer();
+        if (srcPtr) {
+            std::memcpy(inBuf.data(), srcPtr, numVoxels * sizeof(unsigned short));
+        } else {
+            itk::ImageRegionConstIterator<VolumeType> it(input, region);
+            size_t i = 0;
+            for (it.GoToBegin(); !it.IsAtEnd(); ++it) inBuf[i++] = it.Get();
+        }
+
+        std::vector<unsigned short> outBuf;
+        ctseg_gpu::gaussianFilter3D(inBuf, outBuf, w, h, d, sigma);
+
+        auto output = VolumeType::New();
+        output->SetRegions(region);
+        output->SetSpacing(input->GetSpacing());
+        output->SetOrigin(input->GetOrigin());
+        output->Allocate();
+        unsigned short* dstPtr = output->GetBufferPointer();
+        if (dstPtr) {
+            std::memcpy(dstPtr, outBuf.data(), numVoxels * sizeof(unsigned short));
+        } else {
+            itk::ImageRegionIterator<VolumeType> outIt(output, region);
+            size_t i = 0;
+            for (outIt.GoToBegin(); !outIt.IsAtEnd(); ++outIt) outIt.Set(outBuf[i++]);
+        }
         return output;
     }
 
@@ -66,11 +114,17 @@ private:
         auto region = input->GetLargestPossibleRegion();
         auto size = region.GetSize();
         int w = size[0], h = size[1], d = size[2];
+        size_t numVoxels = static_cast<size_t>(w) * h * d;
 
-        std::vector<unsigned char> inBuf(static_cast<size_t>(w) * h * d);
-        itk::ImageRegionConstIterator<LabelVolumeType> it(input, region);
-        size_t i = 0;
-        for (it.GoToBegin(); !it.IsAtEnd(); ++it) inBuf[i++] = it.Get();
+        std::vector<unsigned char> inBuf(numVoxels);
+        const unsigned char* srcPtr = input->GetBufferPointer();
+        if (srcPtr) {
+            std::memcpy(inBuf.data(), srcPtr, numVoxels * sizeof(unsigned char));
+        } else {
+            itk::ImageRegionConstIterator<LabelVolumeType> it(input, region);
+            size_t i = 0;
+            for (it.GoToBegin(); !it.IsAtEnd(); ++it) inBuf[i++] = it.Get();
+        }
 
         std::vector<unsigned char> outBuf;
         ctseg_gpu::morphology3D(inBuf, outBuf, w, h, d, radius, op);
@@ -80,9 +134,14 @@ private:
         output->SetSpacing(input->GetSpacing());
         output->SetOrigin(input->GetOrigin());
         output->Allocate();
-        itk::ImageRegionIterator<LabelVolumeType> outIt(output, region);
-        i = 0;
-        for (outIt.GoToBegin(); !outIt.IsAtEnd(); ++outIt) outIt.Set(outBuf[i++]);
+        unsigned char* dstPtr = output->GetBufferPointer();
+        if (dstPtr) {
+            std::memcpy(dstPtr, outBuf.data(), numVoxels * sizeof(unsigned char));
+        } else {
+            itk::ImageRegionIterator<LabelVolumeType> outIt(output, region);
+            size_t i = 0;
+            for (outIt.GoToBegin(); !outIt.IsAtEnd(); ++outIt) outIt.Set(outBuf[i++]);
+        }
         return output;
     }
 };

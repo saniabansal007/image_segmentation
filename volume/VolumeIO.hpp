@@ -210,6 +210,7 @@ public:
         auto writer = WriterType::New();
         writer->SetFileName(path);
         writer->SetInput(volume);
+        writer->UseCompressionOn();
         writer->Update();
     }
 
@@ -218,6 +219,7 @@ public:
         auto writer = WriterType::New();
         writer->SetFileName(path);
         writer->SetInput(volume);
+        writer->UseCompressionOn();
         writer->Update();
     }
 

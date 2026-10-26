@@ -81,12 +81,29 @@ target_link_libraries(ct_viewer
 vtk_module_autoinit(TARGETS ct_viewer MODULES ${VTK_LIBRARIES})
 
 if(HAVE_CUDA)
+    link_directories(BEFORE /usr/lib/x86_64-linux-gnu)
+
     add_executable(ct_segmentation_gpu
         main_volume_gpu.cpp
+        volume/SliceStore.cpp
         gpu/MedianFilter3D.cu
-        gpu/Morphology3D.cu)
+        gpu/GaussianFilter3D.cu
+        gpu/Morphology3D.cu
+        gpu/Segmentation3D.cu)
     set_target_properties(ct_segmentation_gpu PROPERTIES
         CUDA_SEPARABLE_COMPILATION ON
-        CUDA_ARCHITECTURES "60;70;75;80;86")  # covers Pascal through Ampere; trim/extend for your card
-    target_link_libraries(ct_segmentation_gpu ${ITK_LIBRARIES})
+        CUDA_ARCHITECTURES "75;80;86;89")  # 89 for RTX 40-series (Ada Lovelace, RTX 4050)
+    target_link_libraries(ct_segmentation_gpu /usr/lib/x86_64-linux-gnu/libstdc++.so.6 ${ITK_LIBRARIES})
+
+    # Enable GPU acceleration in ct_viewer when CUDA is available
+    target_compile_definitions(ct_viewer PRIVATE HAVE_CUDA=1)
+    target_sources(ct_viewer PRIVATE
+        gpu/MedianFilter3D.cu
+        gpu/GaussianFilter3D.cu
+        gpu/Morphology3D.cu
+        gpu/Segmentation3D.cu)
+    set_target_properties(ct_viewer PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+        CUDA_ARCHITECTURES "75;80;86;89")
+    target_link_libraries(ct_viewer /usr/lib/x86_64-linux-gnu/libstdc++.so.6)
 endif()

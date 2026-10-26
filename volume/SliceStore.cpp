@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <cstring>
 #include <cmath>
+#include <thread>
+#include <atomic>
 
 namespace ctseg {
 
@@ -536,26 +538,41 @@ VolumeType::Pointer SliceStore::loadFullVolume(std::function<void(int percent, c
     size_t sliceVoxels = static_cast<size_t>(manifest_.dimX) * static_cast<size_t>(manifest_.dimY);
     size_t sliceBytes = sliceVoxels * sizeof(PixelType);
 
-    for (int z = 0; z < manifest_.dimZ; ++z) {
-        std::string slicePath = getSliceFilePath(2, z);
-        std::ifstream in(slicePath, std::ios::binary);
-        PixelType* destSlice = outBuffer + static_cast<size_t>(z) * sliceVoxels;
-        if (in.is_open()) {
-            in.read(reinterpret_cast<char*>(destSlice), sliceBytes);
-            if (!in || static_cast<size_t>(in.gcount()) != sliceBytes) {
-                size_t readVoxels = in.gcount() / sizeof(PixelType);
-                for (size_t i = readVoxels; i < sliceVoxels; ++i) {
-                    destSlice[i] = 0;
+    unsigned int numThreads = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
+    std::atomic<int> completedSlices{0};
+    std::vector<std::thread> workers;
+    workers.reserve(numThreads);
+
+    for (unsigned int t = 0; t < numThreads; ++t) {
+        workers.emplace_back([&, t]() {
+            int zStart = static_cast<int>(t * manifest_.dimZ / numThreads);
+            int zEnd = static_cast<int>((t + 1) * manifest_.dimZ / numThreads);
+            for (int z = zStart; z < zEnd; ++z) {
+                std::string slicePath = getSliceFilePath(2, z);
+                std::ifstream in(slicePath, std::ios::binary);
+                PixelType* destSlice = outBuffer + static_cast<size_t>(z) * sliceVoxels;
+                if (in.is_open()) {
+                    in.read(reinterpret_cast<char*>(destSlice), sliceBytes);
+                    if (!in || static_cast<size_t>(in.gcount()) != sliceBytes) {
+                        size_t readVoxels = in.gcount() / sizeof(PixelType);
+                        for (size_t i = readVoxels; i < sliceVoxels; ++i) {
+                            destSlice[i] = 0;
+                        }
+                    }
+                } else {
+                    std::memset(destSlice, 0, sliceBytes);
+                }
+
+                int done = ++completedSlices;
+                if (progressCallback && (done % 50 == 0 || done == manifest_.dimZ)) {
+                    int pct = done * 100 / manifest_.dimZ;
+                    progressCallback(pct, "Loading 3D volume: " + std::to_string(done) + "/" + std::to_string(manifest_.dimZ) + " slices");
                 }
             }
-        } else {
-            std::memset(destSlice, 0, sliceBytes);
-        }
-
-        if (progressCallback && (z % 50 == 0 || z == manifest_.dimZ - 1)) {
-            int pct = static_cast<int>((z + 1) * 100 / manifest_.dimZ);
-            progressCallback(pct, "Loading 3D volume slice " + std::to_string(z + 1) + "/" + std::to_string(manifest_.dimZ));
-        }
+        });
+    }
+    for (auto& w : workers) {
+        w.join();
     }
 
     return volume;

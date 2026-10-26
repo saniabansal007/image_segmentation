@@ -95,15 +95,15 @@ void morphology3D(const std::vector<unsigned char>& input,
 
 // Open = erode then dilate; Close = dilate then erode. Composed here on
 // the host from the two primitives above rather than as separate kernels.
-inline void morphologyOpen3D(const std::vector<unsigned char>& input, std::vector<unsigned char>& output,
-                              int width, int height, int depth, int radius) {
+void morphologyOpen3D(const std::vector<unsigned char>& input, std::vector<unsigned char>& output,
+                      int width, int height, int depth, int radius) {
     std::vector<unsigned char> temp;
     morphology3D(input, temp, width, height, depth, radius, MorphOp::Erode);
     morphology3D(temp, output, width, height, depth, radius, MorphOp::Dilate);
 }
 
-inline void morphologyClose3D(const std::vector<unsigned char>& input, std::vector<unsigned char>& output,
-                               int width, int height, int depth, int radius) {
+void morphologyClose3D(const std::vector<unsigned char>& input, std::vector<unsigned char>& output,
+                       int width, int height, int depth, int radius) {
     std::vector<unsigned char> temp;
     morphology3D(input, temp, width, height, depth, radius, MorphOp::Dilate);
     morphology3D(temp, output, width, height, depth, radius, MorphOp::Erode);

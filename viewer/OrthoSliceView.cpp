@@ -187,6 +187,8 @@ void OrthoSliceView::setupVTKPipeline() {
     maskFillActor_->GetProperty()->SetLookupTable(maskLut_);
     maskFillActor_->GetProperty()->UseLookupTableScalarRangeOn();
     maskFillActor_->GetProperty()->SetInterpolationTypeToNearest();
+    maskFillActor_->GetProperty()->SetColorWindow(1.0);
+    maskFillActor_->GetProperty()->SetColorLevel(0.5);
     maskFillActor_->GetProperty()->SetOpacity(1.0);
     maskFillActor_->SetVisibility(false);
     renderer_->AddActor(maskFillActor_);

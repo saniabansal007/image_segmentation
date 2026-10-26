@@ -24,6 +24,8 @@ output*.png
 output_*.png
 *.roi.tif
 *.mask.tif
+*.mha
+output*.mha
 
 # Editor & OS
 .vscode/

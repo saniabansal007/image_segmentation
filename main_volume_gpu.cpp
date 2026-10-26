@@ -7,9 +7,12 @@
 #include "volume/VolumeIO.hpp"
 #include "volume/VolumePreprocessing.hpp"
 #include "gpu/GPUPreprocessing.hpp"
+#include "gpu/GPUSegmentation.hpp"
 #include "methods3d/MultiOtsuVolumeSegmenter.hpp"
 #include <iostream>
 #include <chrono>
+
+#include "volume/SliceStore.hpp"
 
 using namespace ctseg;
 
@@ -25,7 +28,29 @@ int main(int argc, char** argv) {
     for (int i = 2; i < argc; ++i) if (std::string(argv[i]) == "--compare-cpu") compareCpu = true;
 
     std::cout << "Loading slice stack from: " << dir << "\n";
-    VolumeType::Pointer volume = VolumeIO::loadVolumeFromDirectory(dir);
+    VolumeType::Pointer volume = nullptr;
+    if (SliceStore::isPreprocessed(dir)) {
+        std::cout << "  Detected preprocessed dataset, loading full volume in parallel...\n";
+        SliceStore store;
+        store.open(dir);
+        volume = store.loadFullVolume([](int pct, const std::string& msg) {
+            std::cout << "  [" << pct << "%] " << msg << "\r" << std::flush;
+        });
+        std::cout << "\n";
+    } else {
+        std::string defPrep = SliceStore::getDefaultPreprocessedDir(dir);
+        if (SliceStore::isPreprocessed(defPrep)) {
+            std::cout << "  Found preprocessed store at " << defPrep << ", loading in parallel...\n";
+            SliceStore store;
+            store.open(defPrep);
+            volume = store.loadFullVolume([](int pct, const std::string& msg) {
+                std::cout << "  [" << pct << "%] " << msg << "\r" << std::flush;
+            });
+            std::cout << "\n";
+        } else {
+            volume = VolumeIO::loadVolumeFromDirectory(dir);
+        }
+    }
     auto size = volume->GetLargestPossibleRegion().GetSize();
     std::cout << "  volume size: " << size[0] << " x " << size[1] << " x " << size[2] << "\n";
 
@@ -49,14 +74,17 @@ int main(int argc, char** argv) {
         // match the CPU reference on your data.
     }
 
-    std::cout << "Segmenting with 3D Multi-Otsu (" << numClasses << " classes)...\n";
-    MultiOtsuVolumeSegmenter segmenter;
-    ParamMap params = {{"num_classes", static_cast<double>(numClasses)}};
-    VolumeSegmentationResult result = segmenter.segment(processed, params);
-    std::cout << "  runtime: " << result.runtime_ms << " ms (CPU - multi-Otsu wasn't GPU-ported, see README)\n";
+    std::cout << "Segmenting with GPU 3D Multi-Otsu (" << numClasses << " classes)...\n";
+    auto tSeg0 = std::chrono::high_resolution_clock::now();
+    std::vector<unsigned short> thresholds;
+    unsigned int fgCount = 0;
+    auto labels = GPUSegmentation::multiOtsuGPU(processed, 0, 65535, numClasses, numClasses - 1, thresholds, fgCount);
+    auto tSeg1 = std::chrono::high_resolution_clock::now();
+    double gpuSegMs = std::chrono::duration<double, std::milli>(tSeg1 - tSeg0).count();
+    std::cout << "  GPU 3D Multi-Otsu runtime: " << gpuSegMs << " ms (" << fgCount << " foreground voxels)\n";
 
     VolumeIO::saveVolumeMHA(processed, "output_volume_gpu_preprocessed.mha");
-    VolumeIO::saveLabelVolumeMHA(result.labels, "output_volume_gpu_segmented.mha");
+    VolumeIO::saveLabelVolumeMHA(labels, "output_volume_gpu_segmented.mha");
     std::cout << "Saved: output_volume_gpu_preprocessed.mha, output_volume_gpu_segmented.mha\n";
 
     return 0;
