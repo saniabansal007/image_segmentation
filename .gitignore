@@ -31,6 +31,5 @@ Thumbs.db
 
 data_preprocessed_test/
 data_preprocessed/
-README.md
 ct_preprocess
 test_lazy_loading
