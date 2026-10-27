@@ -56,6 +56,25 @@ This builds the following executables inside `build/`:
 
 ## Running
 
+### Quick Start (One-Click Launcher) -- `./run.sh`
+
+Launch the interactive viewer directly with automatic DISPLAY setup, compilation check, and dataset cache verification:
+
+```bash
+./run.sh
+```
+
+You can also pass custom paths or flags directly:
+```bash
+# Open a specific dataset or directory:
+./run.sh data_preprocessed
+
+# Open a single slice file:
+./run.sh data/recon0434.tif
+```
+
+---
+
 ### 1. One-Time Preprocessing -- `ct_preprocess`
 
 Run one-time preprocessing on your raw TIFF dataset to generate planar disk-backed raw slices (`axial/`, `coronal/`, `sagittal/`) with validation and `manifest.json`:
@@ -211,7 +230,6 @@ methods/            2D segmentation methods:
   clustering/       K-means
   edge_morphology/  Canny edges + morphological closing/fill
   watershed/        Gradient-magnitude watershed
-  ml/               Deep learning inference interface (ONNX / TensorRT)
 evaluation/         Dice/Jaccard/overlap metrics vs. ground truth
 
 volume/             3D: VolumeTypes, VolumeIO, SliceStore (LRU cache, multi-planar raw slices)
@@ -266,7 +284,6 @@ cd build
 | `kmeans` | K-means clustering | Converges close to multi-Otsu on well-separated data |
 | `canny_morphology` | Canny edges + morphological close/fill | Thresholds are percentile-based, not fixed |
 | `watershed` | Gradient-magnitude watershed | Calibrated saliency, Otsu air suppression & 3 modes (Targeted, All, Boundaries) |
-| `ml` | Deep Learning / Neural Priors | Extensible interface for ONNX Runtime / TensorRT models |
 
 ---
 
@@ -335,7 +352,6 @@ cd build
 ## Advanced Engineering Frontiers
 
 - **Out-of-Core GPU Streaming with 3D Halo Exchange**: Enables processing multi-gigavoxel CT volumes exceeding physical GPU VRAM via asynchronous CUDA streams, pinned host memory, and overlapping 3D halo boundary exchanges.
-- **Deep Learning & Neural Priors (MONAI / UNETR via TensorRT)**: Direct inference pipeline using 3D vision transformers (UNETR) and MONAI models compiled with TensorRT / ONNX Runtime for precise soft-tissue boundary extraction on low-contrast interfaces.
 
 ---
 
