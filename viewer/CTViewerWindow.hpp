@@ -193,7 +193,10 @@ private:
     QDoubleSpinBox* cannyLowPctSpin_ = nullptr;
     QDoubleSpinBox* cannyHighPctSpin_ = nullptr;
     QSpinBox* cannyRadiusSpin_ = nullptr;
+    QComboBox* watershedModeCombo_ = nullptr;
     QDoubleSpinBox* watershedLevelSpin_ = nullptr;
+    QDoubleSpinBox* watershedThresholdSpin_ = nullptr;
+    QDoubleSpinBox* watershedSigmaSpin_ = nullptr;
 
     QPushButton* applySegBtn_ = nullptr;
     QPushButton* clearSegBtn_ = nullptr;

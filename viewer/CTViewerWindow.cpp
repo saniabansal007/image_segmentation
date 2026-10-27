@@ -43,6 +43,14 @@
 #include <itkExtractImageFilter.h>
 #include <itkTileImageFilter.h>
 #include <itkOutputWindow.h>
+#include <itkCannyEdgeDetectionImageFilter.h>
+#include <itkBinaryMorphologicalClosingImageFilter.h>
+#include <itkBinaryBallStructuringElement.h>
+#include <itkBinaryFillholeImageFilter.h>
+#include <itkWatershedImageFilter.h>
+#include <itkGradientMagnitudeImageFilter.h>
+#include <itkGradientMagnitudeRecursiveGaussianImageFilter.h>
+#include <itkRescaleIntensityImageFilter.h>
 
 #include <chrono>
 #include <vector>
@@ -513,9 +521,15 @@ void CTViewerWindow::setupControlPanel(QWidget* panel) {
     multiOtsuClassesSpin_->setValue(3);
     multiOtsuLayout->addRow("Number of Classes:", multiOtsuClassesSpin_);
     multiOtsuTargetClassSpin_ = new QSpinBox(multiOtsuWidget);
-    multiOtsuTargetClassSpin_->setRange(1, 4);
+    multiOtsuTargetClassSpin_->setRange(0, 4);
     multiOtsuTargetClassSpin_->setValue(2);
     multiOtsuLayout->addRow("Target Foreground Class:", multiOtsuTargetClassSpin_);
+    connect(multiOtsuClassesSpin_, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int nCls) {
+        multiOtsuTargetClassSpin_->setMaximum(nCls - 1);
+        if (multiOtsuTargetClassSpin_->value() >= nCls) {
+            multiOtsuTargetClassSpin_->setValue(nCls - 1);
+        }
+    });
     algorithmParamsStack_->addWidget(multiOtsuWidget);
 
     // Method 3: Region Growing (Confidence)
@@ -560,6 +574,24 @@ void CTViewerWindow::setupControlPanel(QWidget* panel) {
     connThreshUpperSpin_->setRange(0, 65535);
     connThreshUpperSpin_->setValue(4000);
     connLayout->addRow("Upper Bound:", connThreshUpperSpin_);
+
+    auto* connSeedBtn = new QPushButton("🎯 Auto-Range to Seed (±20%)", connWidget);
+    connSeedBtn->setToolTip("Automatically adjust Connected Threshold bounds around the current seed voxel intensity");
+    connLayout->addRow(connSeedBtn);
+    connect(connSeedBtn, &QPushButton::clicked, this, [this]() {
+        int sx = seedXSpin_->value(), sy = seedYSpin_->value(), sz = seedZSpin_->value();
+        double val = 0;
+        if (isLazyLoadingMode_ && sliceStore_) val = sliceStore_->getVoxelValue(sx, sy, sz);
+        else if (displayVolume_) {
+            VolumeType::IndexType idx = {sx, sy, sz};
+            if (displayVolume_->GetLargestPossibleRegion().IsInside(idx)) val = displayVolume_->GetPixel(idx);
+        }
+        double margin = std::max(50.0, std::max(autoWindow_ * 0.2, val * 0.2));
+        connThreshLowerSpin_->setValue(std::max(0, static_cast<int>(val - margin)));
+        connThreshUpperSpin_->setValue(std::min(65535, static_cast<int>(val + margin)));
+        statusPerfLabel_->setText(QString("Connected Threshold auto-ranged around seed (%1, %2, %3) val %4: [%5, %6]")
+            .arg(sx).arg(sy).arg(sz).arg(val).arg(connThreshLowerSpin_->value()).arg(connThreshUpperSpin_->value()));
+    });
     algorithmParamsStack_->addWidget(connWidget);
 
     // Method 5: K-Means
@@ -574,6 +606,12 @@ void CTViewerWindow::setupControlPanel(QWidget* panel) {
     kmeansTargetClusterSpin_->setRange(0, 5);
     kmeansTargetClusterSpin_->setValue(1);
     kmLayout->addRow("Target Cluster Index:", kmeansTargetClusterSpin_);
+    connect(kmeansClustersSpin_, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int nClust) {
+        kmeansTargetClusterSpin_->setMaximum(nClust - 1);
+        if (kmeansTargetClusterSpin_->value() >= nClust) {
+            kmeansTargetClusterSpin_->setValue(nClust - 1);
+        }
+    });
     algorithmParamsStack_->addWidget(kmWidget);
 
     // Method 6: Canny Morphology
@@ -595,11 +633,39 @@ void CTViewerWindow::setupControlPanel(QWidget* panel) {
     auto* wsWidget = new QWidget(segGroup);
     auto* wsLayout = new QFormLayout(wsWidget);
     wsLayout->setContentsMargins(0, 0, 0, 0);
+
+    watershedModeCombo_ = new QComboBox(wsWidget);
+    watershedModeCombo_->addItem("Targeted Structure at Seed (Interactive)", 0);
+    watershedModeCombo_->addItem("All Segmented Structures (Split Touching)", 1);
+    watershedModeCombo_->addItem("Watershed Boundary Outlines", 2);
+    watershedModeCombo_->setToolTip("Targeted Structure: Segments the complete anatomical object at the seed crosshair.\nAll Structures: Segments all foreground objects separated along watershed lines.\nBoundaries: Renders clean border lines between adjacent structures.");
+    wsLayout->addRow("Mode:", watershedModeCombo_);
+
     watershedLevelSpin_ = new QDoubleSpinBox(wsWidget);
-    watershedLevelSpin_->setRange(0.01, 0.5);
-    watershedLevelSpin_->setValue(0.05);
-    watershedLevelSpin_->setSingleStep(0.01);
-    wsLayout->addRow("Water Level / Threshold:", watershedLevelSpin_);
+    watershedLevelSpin_->setRange(0.01, 1.0);
+    watershedLevelSpin_->setValue(0.20);
+    watershedLevelSpin_->setSingleStep(0.05);
+    watershedLevelSpin_->setToolTip("Water level merge depth fraction (0.01 - 1.0). Higher values merge sub-basins into larger, unified anatomical structures.");
+    wsLayout->addRow("Water Level / Merge:", watershedLevelSpin_);
+
+    watershedThresholdSpin_ = new QDoubleSpinBox(wsWidget);
+    watershedThresholdSpin_->setRange(0.001, 0.5);
+    watershedThresholdSpin_->setValue(0.05);
+    watershedThresholdSpin_->setSingleStep(0.01);
+    watershedThresholdSpin_->setToolTip("Gradient saliency threshold (0.001 - 0.5). Suppresses low-contrast noise basins before flooding.");
+    wsLayout->addRow("Noise Threshold:", watershedThresholdSpin_);
+
+    watershedSigmaSpin_ = new QDoubleSpinBox(wsWidget);
+    watershedSigmaSpin_->setRange(0.5, 5.0);
+    watershedSigmaSpin_->setValue(1.5);
+    watershedSigmaSpin_->setSingleStep(0.5);
+    watershedSigmaSpin_->setToolTip("Gaussian smoothing sigma before gradient. Suppresses image noise to prevent over-segmentation.");
+    wsLayout->addRow("Smoothing Sigma (σ):", watershedSigmaSpin_);
+
+    auto* wsHint = new QLabel("<span style='color:#94A3B8; font-size:11px;'>Left-click any slice view to place the seed on the target anatomical structure.</span>", wsWidget);
+    wsHint->setWordWrap(true);
+    wsLayout->addRow(wsHint);
+
     algorithmParamsStack_->addWidget(wsWidget);
 
     segLayout->addWidget(algorithmParamsStack_);
@@ -914,6 +980,11 @@ bool CTViewerWindow::loadVolumeFromDirectory(const std::string& dirPath, size_t 
         threshLowerSpin_->setValue(static_cast<int>(autoLevel_));
         threshUpperSpin_->setValue(static_cast<int>(maxVoxelVal_));
 
+        connThreshLowerSpin_->setRange(static_cast<int>(minVoxelVal_), static_cast<int>(maxVoxelVal_));
+        connThreshUpperSpin_->setRange(static_cast<int>(minVoxelVal_), static_cast<int>(maxVoxelVal_));
+        connThreshLowerSpin_->setValue(static_cast<int>(std::max(minVoxelVal_, autoLevel_ - autoWindow_ * 0.2)));
+        connThreshUpperSpin_->setValue(static_cast<int>(std::min(maxVoxelVal_, autoLevel_ + autoWindow_ * 0.2)));
+
         dimX_ = static_cast<int>(size[0]);
         dimY_ = static_cast<int>(size[1]);
         dimZ_ = static_cast<int>(size[2]);
@@ -991,6 +1062,11 @@ bool CTViewerWindow::loadPreprocessedDataset(const std::string& preprocessedDir)
         threshUpperSpin_->setRange(static_cast<int>(minVoxelVal_), static_cast<int>(maxVoxelVal_));
         threshLowerSpin_->setValue(static_cast<int>(autoLevel_));
         threshUpperSpin_->setValue(static_cast<int>(maxVoxelVal_));
+
+        connThreshLowerSpin_->setRange(static_cast<int>(minVoxelVal_), static_cast<int>(maxVoxelVal_));
+        connThreshUpperSpin_->setRange(static_cast<int>(minVoxelVal_), static_cast<int>(maxVoxelVal_));
+        connThreshLowerSpin_->setValue(static_cast<int>(std::max(minVoxelVal_, autoLevel_ - autoWindow_ * 0.2)));
+        connThreshUpperSpin_->setValue(static_cast<int>(std::min(maxVoxelVal_, autoLevel_ + autoWindow_ * 0.2)));
 
         // Initialize geometry on each OrthoSliceView
         double sp[3] = {manifest.spacingX, manifest.spacingY, manifest.spacingZ};
@@ -2378,7 +2454,13 @@ void CTViewerWindow::onApplySegmentationClicked() {
     int connHi = connThreshUpperSpin_->value();
     int k = kmeansClustersSpin_->value();
     int targetCluster = kmeansTargetClusterSpin_->value();
+    int watershedMode = watershedModeCombo_ ? watershedModeCombo_->currentIndex() : 0;
     double watershedLevel = watershedLevelSpin_->value();
+    double watershedThreshold = watershedThresholdSpin_ ? watershedThresholdSpin_->value() : 0.05;
+    double watershedSigma = watershedSigmaSpin_ ? watershedSigmaSpin_->value() : 1.5;
+    double cannyLowPct = cannyLowPctSpin_ ? cannyLowPctSpin_->value() : 90.0;
+    double cannyHighPct = cannyHighPctSpin_ ? cannyHighPctSpin_->value() : 99.0;
+    unsigned int cannyRadius = cannyRadiusSpin_ ? static_cast<unsigned int>(cannyRadiusSpin_->value()) : 2;
     double minVox = minVoxelVal_;
     double maxVox = maxVoxelVal_;
 
@@ -2391,7 +2473,7 @@ void CTViewerWindow::onApplySegmentationClicked() {
                                            sp0 = spacing[0], sp1 = spacing[1], sp2 = spacing[2],
                                            orig0 = origin[0], orig1 = origin[1], orig2 = origin[2],
                                            algIdx, lo, hi, numClasses, targetClass, seed, mult, iters, radius,
-                                           connLo, connHi, k, targetCluster, watershedLevel, minVox, maxVox]() {
+                                           connLo, connHi, k, targetCluster, watershedMode, watershedLevel, watershedThreshold, watershedSigma, cannyLowPct, cannyHighPct, cannyRadius, minVox, maxVox]() {
         LabelVolumeType::Pointer outMask = nullptr;
         QString segName;
         bool aborted = false;
@@ -2473,10 +2555,11 @@ void CTViewerWindow::onApplySegmentationClicked() {
                         currentProcessObject_ = filter;
                         filter->Update();
                         const uint8_t* raw = filter->GetOutput()->GetBufferPointer();
+                        int effTarget = std::max(0, std::min(numClasses - 1, targetClass));
                         for (size_t i = 0; i < mask.size(); ++i) {
-                            mask[i] = (raw[i] == targetClass ? 1 : 0);
+                            mask[i] = (raw[i] == effTarget ? 1 : 0);
                         }
-                        outName = QString("Multi-Otsu (%1 cls, target %2)").arg(numClasses).arg(targetClass);
+                        outName = QString("Multi-Otsu (%1 cls, target %2)").arg(numClasses).arg(effTarget);
                     } else if (algIdx == 3) { // Region Growing
                         using GrowType = itk::ConfidenceConnectedImageFilter<VolumeType, VolumeType>;
                         auto grow = GrowType::New();
@@ -2490,10 +2573,14 @@ void CTViewerWindow::onApplySegmentationClicked() {
                         grow->SetInitialNeighborhoodRadius(radius);
                         grow->SetReplaceValue(1);
                         currentProcessObject_ = grow;
-                        grow->Update();
-                        const uint16_t* gPtr = grow->GetOutput()->GetBufferPointer();
-                        for (size_t i = 0; i < mask.size(); ++i) {
-                            mask[i] = (gPtr[i] > 0 ? 1 : 0);
+                        try {
+                            grow->Update();
+                            const uint16_t* gPtr = grow->GetOutput()->GetBufferPointer();
+                            for (size_t i = 0; i < mask.size(); ++i) {
+                                mask[i] = (gPtr[i] > 0 ? 1 : 0);
+                            }
+                        } catch (...) {
+                            mask.assign(mask.size(), 0);
                         }
                         outName = QString("Region Grow (seed: %1, %2)").arg(seed2D[0]).arg(seed2D[1]);
                     } else if (algIdx == 4) { // Connected Threshold
@@ -2503,47 +2590,227 @@ void CTViewerWindow::onApplySegmentationClicked() {
                         VolumeType::IndexType sIdx = {std::max(0, std::min(w - 1, seed2D[0])),
                                                       std::max(0, std::min(h - 1, seed2D[1])),
                                                       0};
+                        size_t seedPixelIdx = static_cast<size_t>(sIdx[1]) * w + sIdx[0];
+                        int seedVal = pixels[seedPixelIdx];
+                        int effLo = std::min(connLo, seedVal);
+                        int effHi = std::max(connHi, seedVal);
                         conn->AddSeed(sIdx);
-                        conn->SetLower(connLo);
-                        conn->SetUpper(connHi);
+                        conn->SetLower(effLo);
+                        conn->SetUpper(effHi);
                         conn->SetReplaceValue(1);
                         currentProcessObject_ = conn;
-                        conn->Update();
-                        const uint16_t* cPtr = conn->GetOutput()->GetBufferPointer();
-                        for (size_t i = 0; i < mask.size(); ++i) {
-                            mask[i] = (cPtr[i] > 0 ? 1 : 0);
+                        try {
+                            conn->Update();
+                            const uint16_t* cPtr = conn->GetOutput()->GetBufferPointer();
+                            for (size_t i = 0; i < mask.size(); ++i) {
+                                mask[i] = (cPtr[i] > 0 ? 1 : 0);
+                            }
+                        } catch (...) {
+                            mask.assign(mask.size(), 0);
                         }
-                        outName = QString("Connected Thresh [%1, %2]").arg(connLo).arg(connHi);
-                    } else if (algIdx == 5) { // K-Means
-                        using OtsuType = itk::OtsuThresholdImageFilter<VolumeType, LabelVolumeType>;
-                        auto otsu = OtsuType::New();
-                        otsu->SetInput(sliceVol);
-                        otsu->SetInsideValue(0);
-                        otsu->SetOutsideValue(1);
-                        currentProcessObject_ = otsu;
-                        otsu->Update();
-                        std::memcpy(mask.data(), otsu->GetOutput()->GetBufferPointer(), mask.size());
-                        outName = QString("K-Means (k=%1, target %2)").arg(k).arg(targetCluster);
-                    } else if (algIdx == 6) { // Canny Morphology
-                        using OtsuType = itk::OtsuThresholdImageFilter<VolumeType, LabelVolumeType>;
-                        auto otsu = OtsuType::New();
-                        otsu->SetInput(sliceVol);
-                        otsu->SetInsideValue(0);
-                        otsu->SetOutsideValue(1);
-                        currentProcessObject_ = otsu;
-                        otsu->Update();
-                        std::memcpy(mask.data(), otsu->GetOutput()->GetBufferPointer(), mask.size());
-                        outName = "Canny Morphology";
-                    } else if (algIdx == 7) { // Watershed
-                        using OtsuType = itk::OtsuThresholdImageFilter<VolumeType, LabelVolumeType>;
-                        auto otsu = OtsuType::New();
-                        otsu->SetInput(sliceVol);
-                        otsu->SetInsideValue(0);
-                        otsu->SetOutsideValue(1);
-                        currentProcessObject_ = otsu;
-                        otsu->Update();
-                        std::memcpy(mask.data(), otsu->GetOutput()->GetBufferPointer(), mask.size());
-                        outName = QString("Watershed (lvl=%1)").arg(watershedLevel);
+                        outName = QString("Connected Thresh [%1, %2] (seed: %3,%4 val=%5)").arg(effLo).arg(effHi).arg(sIdx[0]).arg(sIdx[1]).arg(seedVal);
+                    } else if (algIdx == 5) { // Real K-Means Clustering
+                        try {
+                            using KMType = itk::ScalarImageKmeansImageFilter<VolumeType>;
+                            auto km = KMType::New();
+                            km->SetInput(sliceVol);
+                            for (int i = 0; i < k; ++i) {
+                                double mean = minVox + (maxVox - minVox) * (i + 0.5) / k;
+                                km->AddClassWithInitialMean(mean);
+                            }
+                            currentProcessObject_ = km;
+                            km->Update();
+                            auto kmOut = km->GetOutput();
+                            itk::ImageRegionConstIterator<KMType::OutputImageType> kmIt(kmOut, kmOut->GetLargestPossibleRegion());
+                            int effTarget = std::max(0, std::min(k - 1, targetCluster));
+                            size_t idx = 0;
+                            for (kmIt.GoToBegin(); !kmIt.IsAtEnd() && idx < mask.size(); ++kmIt, ++idx) {
+                                mask[idx] = (static_cast<int>(kmIt.Get()) == effTarget ? 1 : 0);
+                            }
+                        } catch (...) {
+                            mask.assign(mask.size(), 0);
+                        }
+                        outName = QString("K-Means (k=%1, target %2)").arg(k).arg(std::min(k - 1, targetCluster));
+                    } else if (algIdx == 6) { // Real Canny Edge Detection + Morphological Closing & Fillhole
+                        try {
+                            using FloatImgType = itk::Image<float, 3>;
+                            auto caster = itk::CastImageFilter<VolumeType, FloatImgType>::New();
+                            caster->SetInput(sliceVol);
+                            caster->Update();
+
+                            auto grad = itk::GradientMagnitudeImageFilter<FloatImgType, FloatImgType>::New();
+                            grad->SetInput(caster->GetOutput());
+                            grad->Update();
+
+                            std::vector<float> vals;
+                            vals.reserve(static_cast<size_t>(w) * h);
+                            itk::ImageRegionConstIterator<FloatImgType> gIt(grad->GetOutput(), grad->GetOutput()->GetLargestPossibleRegion());
+                            for (gIt.GoToBegin(); !gIt.IsAtEnd(); ++gIt) vals.push_back(gIt.Get());
+                            std::sort(vals.begin(), vals.end());
+
+                            double loTh = vals[static_cast<size_t>(cannyLowPct / 100.0 * (vals.size() - 1))];
+                            double hiTh = vals[static_cast<size_t>(cannyHighPct / 100.0 * (vals.size() - 1))];
+                            if (hiTh <= loTh) hiTh = loTh + 1.0;
+
+                            auto canny = itk::CannyEdgeDetectionImageFilter<FloatImgType, FloatImgType>::New();
+                            canny->SetInput(caster->GetOutput());
+                            canny->SetVariance(2.0);
+                            canny->SetLowerThreshold(loTh);
+                            canny->SetUpperThreshold(hiTh);
+
+                            auto binTh = itk::BinaryThresholdImageFilter<FloatImgType, LabelVolumeType>::New();
+                            binTh->SetInput(canny->GetOutput());
+                            binTh->SetLowerThreshold(0.01);
+                            binTh->SetUpperThreshold(itk::NumericTraits<float>::max());
+                            binTh->SetInsideValue(1);
+                            binTh->SetOutsideValue(0);
+
+                            using BallType = itk::BinaryBallStructuringElement<uint8_t, 3>;
+                            BallType ball;
+                            ball.SetRadius(cannyRadius);
+                            ball.CreateStructuringElement();
+
+                            auto closing = itk::BinaryMorphologicalClosingImageFilter<LabelVolumeType, LabelVolumeType, BallType>::New();
+                            closing->SetInput(binTh->GetOutput());
+                            closing->SetKernel(ball);
+                            closing->SetForegroundValue(1);
+
+                            auto fillHole = itk::BinaryFillholeImageFilter<LabelVolumeType>::New();
+                            fillHole->SetInput(closing->GetOutput());
+                            fillHole->SetForegroundValue(1);
+                            currentProcessObject_ = fillHole;
+                            fillHole->Update();
+
+                            std::memcpy(mask.data(), fillHole->GetOutput()->GetBufferPointer(), mask.size());
+                        } catch (...) {
+                            mask.assign(mask.size(), 0);
+                        }
+                        outName = QString("Canny Edge + Morphology (p%1/p%2, r=%3)").arg(cannyLowPct).arg(cannyHighPct).arg(cannyRadius);
+                    } else if (algIdx == 7) { // Watershed Segmentation
+                        try {
+                            using Slice2DType = itk::Image<float, 2>;
+                            auto sliceImg = Slice2DType::New();
+                            Slice2DType::RegionType reg2D;
+                            reg2D.SetSize({static_cast<Slice2DType::SizeValueType>(w), static_cast<Slice2DType::SizeValueType>(h)});
+                            sliceImg->SetRegions(reg2D);
+                            sliceImg->Allocate();
+                            float* sPtr = sliceImg->GetBufferPointer();
+                            for (size_t i = 0; i < mask.size(); ++i) {
+                                sPtr[i] = static_cast<float>(pixels[i]);
+                            }
+
+                            // 1. Rescale image intensity to [0.0, 1.0]
+                            auto inRescale = itk::RescaleIntensityImageFilter<Slice2DType, Slice2DType>::New();
+                            inRescale->SetInput(sliceImg);
+                            inRescale->SetOutputMinimum(0.0f);
+                            inRescale->SetOutputMaximum(1.0f);
+
+                            // 2. Gaussian-smoothed gradient magnitude
+                            auto grad = itk::GradientMagnitudeRecursiveGaussianImageFilter<Slice2DType, Slice2DType>::New();
+                            grad->SetInput(inRescale->GetOutput());
+                            grad->SetSigma(watershedSigma);
+
+                            // 3. Rescale gradient magnitude to [0.0, 1.0] so ITK's Threshold & Level operate as calibrated saliency percentages
+                            auto gradRescale = itk::RescaleIntensityImageFilter<Slice2DType, Slice2DType>::New();
+                            gradRescale->SetInput(grad->GetOutput());
+                            gradRescale->SetOutputMinimum(0.0f);
+                            gradRescale->SetOutputMaximum(1.0f);
+
+                            // 4. Watershed flooding
+                            auto ws = itk::WatershedImageFilter<Slice2DType>::New();
+                            ws->SetInput(gradRescale->GetOutput());
+                            ws->SetLevel(watershedLevel);
+                            ws->SetThreshold(watershedThreshold);
+                            currentProcessObject_ = ws;
+                            ws->Update();
+
+                            auto rawWS = ws->GetOutput();
+                            const auto* wsPtr = rawWS->GetBufferPointer();
+
+                            // 5. Automatic Otsu foreground thresholding to strictly suppress air/background basins
+                            using OtsuType = itk::OtsuThresholdImageFilter<VolumeType, LabelVolumeType>;
+                            auto otsu = OtsuType::New();
+                            otsu->SetInput(sliceVol);
+                            otsu->SetInsideValue(0);
+                            otsu->SetOutsideValue(1);
+                            otsu->Update();
+                            const uint8_t* fgPtr = otsu->GetOutput()->GetBufferPointer();
+
+                            int sx = std::max(0, std::min(w - 1, seed2D[0]));
+                            int sy = std::max(0, std::min(h - 1, seed2D[1]));
+                            size_t sIdx = static_cast<size_t>(sy) * w + sx;
+
+                            // If seed is in dark background/air, search neighborhood for nearest foreground pixel
+                            if (fgPtr[sIdx] == 0) {
+                                int bestD2 = 999;
+                                for (int dy = -5; dy <= 5; ++dy) {
+                                    int ny = sy + dy;
+                                    if (ny < 0 || ny >= h) continue;
+                                    for (int dx = -5; dx <= 5; ++dx) {
+                                        int nx = sx + dx;
+                                        if (nx < 0 || nx >= w) continue;
+                                        size_t nIdx = static_cast<size_t>(ny) * w + nx;
+                                        if (fgPtr[nIdx] > 0) {
+                                            int d2 = dx * dx + dy * dy;
+                                            if (d2 < bestD2) {
+                                                bestD2 = d2;
+                                                sx = nx; sy = ny;
+                                                sIdx = nIdx;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            if (watershedMode == 0) { // Targeted Structure at Seed (Interactive)
+                                auto targetBasin = wsPtr[sIdx];
+                                for (size_t i = 0; i < mask.size(); ++i) {
+                                    mask[i] = (wsPtr[i] == targetBasin && fgPtr[i] > 0) ? 1 : 0;
+                                }
+                                outName = QString("Watershed Structure (seed: %1,%2, lvl=%3)").arg(sx).arg(sy).arg(watershedLevel);
+                            } else if (watershedMode == 1) { // All Segmented Structures (Split Touching)
+                                for (int y = 0; y < h; ++y) {
+                                    for (int x = 0; x < w; ++x) {
+                                        size_t i = static_cast<size_t>(y) * w + x;
+                                        if (fgPtr[i] == 0) {
+                                            mask[i] = 0;
+                                            continue;
+                                        }
+                                        auto curVal = wsPtr[i];
+                                        bool isBnd = false;
+                                        if (x > 0 && wsPtr[i - 1] != curVal && fgPtr[i - 1] > 0) isBnd = true;
+                                        else if (x < w - 1 && wsPtr[i + 1] != curVal && fgPtr[i + 1] > 0) isBnd = true;
+                                        else if (y > 0 && wsPtr[i - w] != curVal && fgPtr[i - w] > 0) isBnd = true;
+                                        else if (y < h - 1 && wsPtr[i + w] != curVal && fgPtr[i + w] > 0) isBnd = true;
+
+                                        // Keep all foreground structures; leave 1-px watershed line uncolored to split touching lobes
+                                        mask[i] = isBnd ? 0 : 1;
+                                    }
+                                }
+                                outName = QString("Watershed All Structures (lvl=%1)").arg(watershedLevel);
+                            } else { // Watershed Boundary Outlines
+                                for (int y = 0; y < h; ++y) {
+                                    for (int x = 0; x < w; ++x) {
+                                        size_t i = static_cast<size_t>(y) * w + x;
+                                        if (fgPtr[i] == 0) {
+                                            mask[i] = 0;
+                                            continue;
+                                        }
+                                        auto curVal = wsPtr[i];
+                                        bool isBnd = false;
+                                        if (x > 0 && wsPtr[i - 1] != curVal && fgPtr[i - 1] > 0) isBnd = true;
+                                        else if (x < w - 1 && wsPtr[i + 1] != curVal && fgPtr[i + 1] > 0) isBnd = true;
+                                        else if (y > 0 && wsPtr[i - w] != curVal && fgPtr[i - w] > 0) isBnd = true;
+                                        else if (y < h - 1 && wsPtr[i + w] != curVal && fgPtr[i + w] > 0) isBnd = true;
+
+                                        mask[i] = isBnd ? 1 : 0;
+                                    }
+                                }
+                                outName = QString("Watershed Boundaries (lvl=%1)").arg(watershedLevel);
+                            }
+                        } catch (...) {
+                            mask.assign(mask.size(), 0);
+                        }
                     }
                     return mask;
                 };
@@ -2789,9 +3056,10 @@ void CTViewerWindow::onApplySegmentationClicked() {
                     itk::ImageRegionIterator<LabelVolumeType> oIt(outMask, outMask->GetLargestPossibleRegion());
                     for (inIt.GoToBegin(), oIt.GoToBegin(); !inIt.IsAtEnd(); ++inIt, ++oIt) {
                         if (cancelRequested_.load()) { aborted = true; break; }
-                        oIt.Set(static_cast<int>(inIt.Get()) == targetCluster ? 1 : 0);
+                        int effTarget = std::max(0, std::min(k - 1, targetCluster));
+                        oIt.Set(static_cast<int>(inIt.Get()) == effTarget ? 1 : 0);
                     }
-                    segName = QString("K-Means (k=%1, target %2)").arg(k).arg(targetCluster);
+                    segName = QString("K-Means (k=%1, target %2)").arg(k).arg(std::min(k - 1, targetCluster));
                 }
 
             } else if (algIdx == 6) { // Canny Morphology
@@ -2799,9 +3067,9 @@ void CTViewerWindow::onApplySegmentationClicked() {
                 bool gpuDone = false;
                 try {
                     unsigned int gpuFg = 0;
-                    outMask = ctseg::GPUSegmentation::cannyMorphologyGPU(inputVol, static_cast<unsigned short>(minVox), static_cast<unsigned short>(maxVox), 2, gpuFg);
+                    outMask = ctseg::GPUSegmentation::cannyMorphologyGPU(inputVol, static_cast<unsigned short>(minVox), static_cast<unsigned short>(maxVox), cannyRadius, gpuFg);
                     fgCount = gpuFg;
-                    segName = "Canny Edge + Morphological Closing [CUDA GPU]";
+                    segName = QString("Canny Edge + Morphological Closing (r=%1) [CUDA GPU]").arg(cannyRadius);
                     gpuDone = true;
                 } catch (const std::exception& e) {
                     gpuDone = false;
@@ -2809,36 +3077,192 @@ void CTViewerWindow::onApplySegmentationClicked() {
                 if (!gpuDone)
 #endif
                 {
-                    using OtsuType = itk::OtsuThresholdImageFilter<VolumeType, LabelVolumeType>;
-                    auto otsu = OtsuType::New();
-                    otsu->SetInput(inputVol);
-                    otsu->SetInsideValue(0);
-                    otsu->SetOutsideValue(1);
-                    currentProcessObject_ = otsu;
-                    otsu->AddObserver(itk::ProgressEvent(), makeObserver());
-                    otsu->Update();
+                    using FloatVolType = itk::Image<float, 3>;
+                    auto caster = itk::CastImageFilter<VolumeType, FloatVolType>::New();
+                    caster->SetInput(inputVol);
+                    caster->Update();
+
+                    auto grad = itk::GradientMagnitudeImageFilter<FloatVolType, FloatVolType>::New();
+                    grad->SetInput(caster->GetOutput());
+                    grad->Update();
+
+                    auto binTh = itk::BinaryThresholdImageFilter<FloatVolType, LabelVolumeType>::New();
+                    binTh->SetInput(grad->GetOutput());
+                    binTh->SetLowerThreshold(minVox + (maxVox - minVox) * 0.15);
+                    binTh->SetUpperThreshold(itk::NumericTraits<float>::max());
+                    binTh->SetInsideValue(1);
+                    binTh->SetOutsideValue(0);
+
+                    using BallType = itk::BinaryBallStructuringElement<uint8_t, 3>;
+                    BallType ball;
+                    ball.SetRadius(cannyRadius);
+                    ball.CreateStructuringElement();
+
+                    auto closing = itk::BinaryMorphologicalClosingImageFilter<LabelVolumeType, LabelVolumeType, BallType>::New();
+                    closing->SetInput(binTh->GetOutput());
+                    closing->SetKernel(ball);
+                    closing->SetForegroundValue(1);
+                    currentProcessObject_ = closing;
+                    closing->AddObserver(itk::ProgressEvent(), makeObserver());
+                    closing->Update();
 
                     if (cancelRequested_.load()) aborted = true;
                     else {
-                        outMask = otsu->GetOutput();
-                        segName = "Canny Morphology [CPU]";
+                        outMask = closing->GetOutput();
+                        segName = QString("Canny Morphology (r=%1) [CPU]").arg(cannyRadius);
                     }
                 }
 
             } else if (algIdx == 7) { // Watershed Segmentation
-                using FilterType = itk::OtsuThresholdImageFilter<VolumeType, LabelVolumeType>;
-                auto filter = FilterType::New();
-                filter->SetInput(inputVol);
-                filter->SetInsideValue(0);
-                filter->SetOutsideValue(1);
-                currentProcessObject_ = filter;
-                filter->AddObserver(itk::ProgressEvent(), makeObserver());
-                filter->Update();
+                try {
+                    using FloatVolType = itk::Image<float, 3>;
+                    auto caster = itk::CastImageFilter<VolumeType, FloatVolType>::New();
+                    caster->SetInput(inputVol);
 
-                if (cancelRequested_.load()) aborted = true;
-                else {
-                    outMask = filter->GetOutput();
-                    segName = QString("Watershed (lvl=%1)").arg(watershedLevel);
+                    // 1. Rescale volume intensity to [0.0, 1.0]
+                    auto inRescale = itk::RescaleIntensityImageFilter<FloatVolType, FloatVolType>::New();
+                    inRescale->SetInput(caster->GetOutput());
+                    inRescale->SetOutputMinimum(0.0f);
+                    inRescale->SetOutputMaximum(1.0f);
+
+                    // 2. Gaussian-smoothed gradient magnitude
+                    auto grad = itk::GradientMagnitudeRecursiveGaussianImageFilter<FloatVolType, FloatVolType>::New();
+                    grad->SetInput(inRescale->GetOutput());
+                    grad->SetSigma(watershedSigma);
+
+                    // 3. Rescale gradient magnitude to [0.0, 1.0] so ITK's Threshold & Level operate as calibrated saliency percentages
+                    auto gradRescale = itk::RescaleIntensityImageFilter<FloatVolType, FloatVolType>::New();
+                    gradRescale->SetInput(grad->GetOutput());
+                    gradRescale->SetOutputMinimum(0.0f);
+                    gradRescale->SetOutputMaximum(1.0f);
+
+                    // 4. Watershed flooding
+                    auto ws = itk::WatershedImageFilter<FloatVolType>::New();
+                    ws->SetInput(gradRescale->GetOutput());
+                    ws->SetLevel(watershedLevel);
+                    ws->SetThreshold(watershedThreshold);
+                    currentProcessObject_ = ws;
+                    ws->AddObserver(itk::ProgressEvent(), makeObserver());
+                    ws->Update();
+
+                    if (cancelRequested_.load()) aborted = true;
+                    else {
+                        auto rawWS = ws->GetOutput();
+                        outMask = LabelVolumeType::New();
+                        outMask->SetRegions(rawWS->GetLargestPossibleRegion());
+                        outMask->SetSpacing(rawWS->GetSpacing());
+                        outMask->SetOrigin(rawWS->GetOrigin());
+                        outMask->Allocate();
+
+                        const auto* wsPtr = rawWS->GetBufferPointer();
+                        const auto* inPtr = inputVol->GetBufferPointer();
+                        uint8_t* outPtr = outMask->GetBufferPointer();
+
+                        // 5. Automatic Otsu foreground thresholding to strictly suppress background air/noise
+                        using OtsuType = itk::OtsuThresholdImageFilter<VolumeType, LabelVolumeType>;
+                        auto otsu = OtsuType::New();
+                        otsu->SetInput(inputVol);
+                        otsu->SetInsideValue(0);
+                        otsu->SetOutsideValue(1);
+                        otsu->Update();
+                        double fgThresh = otsu->GetThreshold();
+
+                        size_t sliceSize = static_cast<size_t>(dimX) * dimY;
+                        size_t totalVoxels = sliceSize * dimZ;
+
+                        int sx = std::max(0, std::min(dimX - 1, static_cast<int>(seed[0])));
+                        int sy = std::max(0, std::min(dimY - 1, static_cast<int>(seed[1])));
+                        int sz = std::max(0, std::min(dimZ - 1, static_cast<int>(seed[2])));
+                        size_t sIdx = (static_cast<size_t>(sz) * dimY + sy) * dimX + sx;
+
+                        if (inPtr[sIdx] <= fgThresh) {
+                            int bestD2 = 999;
+                            for (int dz = -3; dz <= 3; ++dz) {
+                                int nz = sz + dz;
+                                if (nz < 0 || nz >= dimZ) continue;
+                                for (int dy = -3; dy <= 3; ++dy) {
+                                    int ny = sy + dy;
+                                    if (ny < 0 || ny >= dimY) continue;
+                                    for (int dx = -3; dx <= 3; ++dx) {
+                                        int nx = sx + dx;
+                                        if (nx < 0 || nx >= dimX) continue;
+                                        size_t nIdx = (static_cast<size_t>(nz) * dimY + ny) * dimX + nx;
+                                        if (inPtr[nIdx] > fgThresh) {
+                                            int d2 = dx * dx + dy * dy + dz * dz;
+                                            if (d2 < bestD2) {
+                                                bestD2 = d2;
+                                                sx = nx; sy = ny; sz = nz;
+                                                sIdx = nIdx;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if (watershedMode == 0) { // Targeted Structure at Seed
+                            auto targetBasin = wsPtr[sIdx];
+                            for (size_t i = 0; i < totalVoxels; ++i) {
+                                if (cancelRequested_.load()) { aborted = true; break; }
+                                outPtr[i] = (wsPtr[i] == targetBasin && inPtr[i] > fgThresh) ? 1 : 0;
+                            }
+                            segName = QString("Watershed Structure (seed: %1,%2,%3, lvl=%4) [CPU]").arg(sx).arg(sy).arg(sz).arg(watershedLevel);
+                        } else if (watershedMode == 1) { // All Segmented Structures (Split Touching)
+                            for (int z = 0; z < dimZ; ++z) {
+                                if (cancelRequested_.load()) { aborted = true; break; }
+                                size_t zOff = static_cast<size_t>(z) * sliceSize;
+                                for (int y = 0; y < dimY; ++y) {
+                                    size_t yOff = zOff + static_cast<size_t>(y) * dimX;
+                                    for (int x = 0; x < dimX; ++x) {
+                                        size_t i = yOff + x;
+                                        if (inPtr[i] <= fgThresh) {
+                                            outPtr[i] = 0;
+                                            continue;
+                                        }
+                                        auto curVal = wsPtr[i];
+                                        bool isBnd = false;
+                                        if (x > 0 && wsPtr[i - 1] != curVal && inPtr[i - 1] > fgThresh) isBnd = true;
+                                        else if (x < dimX - 1 && wsPtr[i + 1] != curVal && inPtr[i + 1] > fgThresh) isBnd = true;
+                                        else if (y > 0 && wsPtr[i - dimX] != curVal && inPtr[i - dimX] > fgThresh) isBnd = true;
+                                        else if (y < dimY - 1 && wsPtr[i + dimX] != curVal && inPtr[i + dimX] > fgThresh) isBnd = true;
+                                        else if (z > 0 && wsPtr[i - sliceSize] != curVal && inPtr[i - sliceSize] > fgThresh) isBnd = true;
+                                        else if (z < dimZ - 1 && wsPtr[i + sliceSize] != curVal && inPtr[i + sliceSize] > fgThresh) isBnd = true;
+
+                                        outPtr[i] = isBnd ? 0 : 1;
+                                    }
+                                }
+                            }
+                            segName = QString("Watershed All Structures (lvl=%1) [CPU]").arg(watershedLevel);
+                        } else { // Basin Boundaries Only
+                            for (int z = 0; z < dimZ; ++z) {
+                                if (cancelRequested_.load()) { aborted = true; break; }
+                                size_t zOff = static_cast<size_t>(z) * sliceSize;
+                                for (int y = 0; y < dimY; ++y) {
+                                    size_t yOff = zOff + static_cast<size_t>(y) * dimX;
+                                    for (int x = 0; x < dimX; ++x) {
+                                        size_t i = yOff + x;
+                                        if (inPtr[i] <= fgThresh) {
+                                            outPtr[i] = 0;
+                                            continue;
+                                        }
+                                        auto curVal = wsPtr[i];
+                                        bool isBnd = false;
+                                        if (x > 0 && wsPtr[i - 1] != curVal && inPtr[i - 1] > fgThresh) isBnd = true;
+                                        else if (x < dimX - 1 && wsPtr[i + 1] != curVal && inPtr[i + 1] > fgThresh) isBnd = true;
+                                        else if (y > 0 && wsPtr[i - dimX] != curVal && inPtr[i - dimX] > fgThresh) isBnd = true;
+                                        else if (y < dimY - 1 && wsPtr[i + dimX] != curVal && inPtr[i + dimX] > fgThresh) isBnd = true;
+                                        else if (z > 0 && wsPtr[i - sliceSize] != curVal && inPtr[i - sliceSize] > fgThresh) isBnd = true;
+                                        else if (z < dimZ - 1 && wsPtr[i + sliceSize] != curVal && inPtr[i + sliceSize] > fgThresh) isBnd = true;
+
+                                        outPtr[i] = isBnd ? 1 : 0;
+                                    }
+                                }
+                            }
+                            segName = QString("Watershed Boundaries (lvl=%1) [CPU]").arg(watershedLevel);
+                        }
+                    }
+                } catch (...) {
+                    aborted = true;
                 }
             }
 
@@ -2908,6 +3332,10 @@ void CTViewerWindow::onResetAlgorithmParamsClicked() {
     regionGrowRadiusSpin_->setValue(2);
     kmeansClustersSpin_->setValue(3);
     kmeansTargetClusterSpin_->setValue(1);
+    if (watershedModeCombo_) watershedModeCombo_->setCurrentIndex(0);
+    if (watershedLevelSpin_) watershedLevelSpin_->setValue(0.20);
+    if (watershedThresholdSpin_) watershedThresholdSpin_->setValue(0.05);
+    if (watershedSigmaSpin_) watershedSigmaSpin_->setValue(1.5);
     statusPerfLabel_->setText("Algorithm parameters reset to defaults");
 }
 
