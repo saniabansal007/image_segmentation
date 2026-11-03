@@ -3,6 +3,9 @@
 A modular C++/ITK/VTK/Qt6 pipeline implementing and comparing multiple segmentation
 approaches on CT slice data, with a full-featured interactive Qt GUI viewer.
 
+## CT Viewer (Multi otsu with gaussian smoothing implemented )
+![alt text](image.png)
+
 ## Dependencies
 
 | Library | Version | Purpose |
