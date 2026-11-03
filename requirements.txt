@@ -1,0 +1,6 @@
+# Python dependencies for CT Segmentation pipeline
+# Required by SliceIO (io/SliceIO.hpp) for fallback TIFF metadata sanitization
+
+tifffile>=2024.1.1
+numpy>=1.24.0
+
