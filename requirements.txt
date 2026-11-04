@@ -4,3 +4,5 @@
 tifffile>=2024.1.1
 numpy>=1.24.0
 
+# Optional: Codecs for compressed TIFF formats (e.g., Deflate, LZW, ZSTD)
+# imagecodecs>=2024.1.1

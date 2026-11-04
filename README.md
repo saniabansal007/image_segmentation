@@ -30,7 +30,9 @@ sudo apt-get install -y \
     libqt6opengl6-dev libqt6openglwidgets6 \
     python3-pip
 
-pip install tifffile   # fallback TIFF metadata sanitizer used by SliceIO
+pip install -r requirements.txt --break-system-packages
+# Or alternatively inside a virtual environment:
+# python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt
 ```
 
 ### 2. Configure and build
@@ -64,6 +66,7 @@ This builds the following executables inside `build/`:
 Launch the interactive viewer directly with automatic DISPLAY setup, compilation check, and dataset cache verification:
 
 ```bash
+chmod +x run.sh
 ./run.sh
 ```
 

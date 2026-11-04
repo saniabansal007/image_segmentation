@@ -81,7 +81,12 @@ target_link_libraries(ct_viewer
 vtk_module_autoinit(TARGETS ct_viewer MODULES ${VTK_LIBRARIES})
 
 if(HAVE_CUDA)
-    link_directories(BEFORE /usr/lib/x86_64-linux-gnu)
+    if(EXISTS "/usr/lib/x86_64-linux-gnu/libstdc++.so.6")
+        set(STDCXX_LIB "/usr/lib/x86_64-linux-gnu/libstdc++.so.6")
+        link_directories(BEFORE /usr/lib/x86_64-linux-gnu)
+    else()
+        set(STDCXX_LIB "stdc++")
+    endif()
 
     add_executable(ct_segmentation_gpu
         main_volume_gpu.cpp
@@ -93,7 +98,7 @@ if(HAVE_CUDA)
     set_target_properties(ct_segmentation_gpu PROPERTIES
         CUDA_SEPARABLE_COMPILATION ON
         CUDA_ARCHITECTURES "75;80;86;89")  # 89 for RTX 40-series (Ada Lovelace, RTX 4050)
-    target_link_libraries(ct_segmentation_gpu /usr/lib/x86_64-linux-gnu/libstdc++.so.6 ${ITK_LIBRARIES})
+    target_link_libraries(ct_segmentation_gpu ${STDCXX_LIB} ${ITK_LIBRARIES})
 
     # Enable GPU acceleration in ct_viewer when CUDA is available
     target_compile_definitions(ct_viewer PRIVATE HAVE_CUDA=1)
@@ -105,5 +110,5 @@ if(HAVE_CUDA)
     set_target_properties(ct_viewer PROPERTIES
         CUDA_SEPARABLE_COMPILATION ON
         CUDA_ARCHITECTURES "75;80;86;89")
-    target_link_libraries(ct_viewer /usr/lib/x86_64-linux-gnu/libstdc++.so.6)
+    target_link_libraries(ct_viewer ${STDCXX_LIB})
 endif()

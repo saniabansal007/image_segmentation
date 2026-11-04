@@ -31,8 +31,8 @@ if [ ! -f "build/ct_viewer" ]; then
     cmake --build build --target ct_viewer -j"$(nproc 2>/dev/null || echo 4)"
 fi
 
-# Automatically generate preprocessed multi-plane cache if missing
-if [ ! -f "data_preprocessed/manifest.json" ] && [ -d "data" ]; then
+# Automatically generate preprocessed multi-plane cache if missing and dataset exists
+if [ ! -f "data_preprocessed/manifest.json" ] && [ -d "data" ] && compgen -G "data/*.tif" > /dev/null 2>&1; then
     echo "==> [run.sh] data_preprocessed/ not detected. Building preprocessor..."
     cmake --build build --target ct_preprocess -j"$(nproc 2>/dev/null || echo 4)"
     echo "==> [run.sh] Preprocessing dataset for instant lazy-loading..."
